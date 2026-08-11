@@ -5,6 +5,10 @@ kline.db-shm
 user_pool.json
 *.log
 
+# 回测报告输出与临时验证截图
+reports/
+_verify_*.png
+
 # Python
 __pycache__/
 *.py[cod]

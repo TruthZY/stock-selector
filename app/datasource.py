@@ -1,8 +1,10 @@
 # -*- coding: utf-8 -*-
-"""行情数据源：腾讯实时快照 + 东方财富历史/增量K线 + 沪深300成分股"""
+"""行情数据源：腾讯实时快照 + 东方财富历史/增量K线 + 沪深300成分股 + BaoStock历史K线"""
 import asyncio
 import re
+import threading
 import time
+from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple
 
 import httpx
@@ -27,12 +29,12 @@ T_IDX = {
 def code_to_market(code: str) -> Tuple[str, str]:
     """返回 (腾讯前缀, 东财secid)，如 ('sh', '1.600519')"""
     code = code.strip()
+    if code.startswith(("4", "8", "92")):
+        return "bj", f"0.{code}"
     if code.startswith(("60", "68", "90")):
         return "sh", f"1.{code}"
     if code.startswith(("00", "30", "20")):
         return "sz", f"0.{code}"
-    if code.startswith(("4", "8")):
-        return "bj", f"0.{code}"
     return "sh", f"1.{code}"
 
 
@@ -240,6 +242,110 @@ class SinaKline:
 
 
 # ---------------------------------------------------------------------------
+# BaoStock 历史K线（免费数据源：日K自1990年，分钟K自2020年，前复权）
+# ---------------------------------------------------------------------------
+
+# BaoStock 周期名映射
+BS_PERIODS = {"5m": "5", "15m": "15", "30m": "30", "60m": "60",
+              "daily": "d", "weekly": "w"}
+BS_FIELDS_MIN = "date,time,open,high,low,close,volume,amount"
+BS_FIELDS_DAY = "date,open,high,low,close,volume,amount"
+
+
+class BaoStockKline:
+    """BaoStock 历史K线：分钟K/日K/周K，前复权，区间查询
+    同步 socket 库，通过 asyncio.to_thread 包装；懒登录 + 线程锁保护
+    注意：baostock 底层为单连接，查询必须串行（_query_lock），并发请求排队执行
+    分钟K volume 单位为股，换算为手（/100）与现有数据一致"""
+
+    _lock = threading.Lock()       # 登录锁
+    _query_lock = threading.Lock() # 查询锁（单连接串行化）
+    _ready = False
+
+    @staticmethod
+    def _ensure_login():
+        import baostock as bs
+        with BaoStockKline._lock:
+            if BaoStockKline._ready:
+                return
+            lg = bs.login()
+            if lg.error_code != "0":
+                raise RuntimeError(f"BaoStock 登录失败: {lg.error_msg}")
+            BaoStockKline._ready = True
+
+    @staticmethod
+    def _symbol(code: str) -> str:
+        if code.startswith(("4", "8", "92")):
+            return f"bj.{code}"
+        if code.startswith(("60", "68")):
+            return f"sh.{code}"
+        return f"sz.{code}"
+
+    @staticmethod
+    def _fetch_sync(code: str, period: str, limit: int, start_date: str,
+                    end_date: str) -> List[dict]:
+        freq = BS_PERIODS.get(period)
+        if freq is None:   # 1m 等不支持周期
+            return []
+        try:
+            BaoStockKline._ensure_login()
+        except Exception:
+            return []
+        fields = BS_FIELDS_MIN if period.endswith("m") else BS_FIELDS_DAY
+        if not start_date:
+            # 未指定起始日期时按 limit 反推天数
+            bpd = 8 if freq in ("5", "15", "30", "60") else 1
+            start_date = (datetime.now() - timedelta(days=int(limit / bpd) + 10)).strftime("%Y-%m-%d")
+        end = end_date or "2099-12-31"
+        import baostock as bs
+        try:
+            # baostock 单连接：查询与遍历必须持有全局锁，否则并发响应错乱；
+            # 查询后加短间隔节流，避免连续请求触发服务器风控挂起
+            with BaoStockKline._query_lock:
+                try:
+                    rs = bs.query_history_k_data_plus(
+                        BaoStockKline._symbol(code), fields, start_date=start_date,
+                        end_date=end, frequency=freq, adjustflag="2")
+                except Exception:
+                    return []
+                out: List[dict] = []
+                while rs.error_code == "0" and rs.next():
+                    row = rs.get_row_data()
+                    try:
+                        if period.endswith("m"):
+                            # time 形如 20240102100000000，取 HH:MM
+                            ts = f"{row[0]} {row[1][8:10]}:{row[1][10:12]}"
+                            o, c, h, l = float(row[2]), float(row[5]), float(row[4]), float(row[3])
+                            volume = float(row[6]) / 100.0      # 股 -> 手
+                            amount = float(row[7])
+                        else:
+                            ts = row[0]
+                            o, c, h, l = float(row[1]), float(row[4]), float(row[3]), float(row[2])
+                            volume = float(row[5]) / 100.0
+                            amount = float(row[6])
+                        out.append({"ts": ts, "open": o, "close": c,
+                                    "high": h, "low": l, "volume": volume, "amount": amount})
+                    except (ValueError, IndexError):
+                        continue
+                time.sleep(0.5)   # 节流：降低连续查询触发限流的概率
+        except Exception:
+            return []
+        return out
+
+    @staticmethod
+    async def fetch_kline(code: str, period: str = "daily", limit: int = 300,
+                          start_date: str = "", end_date: str = "") -> List[dict]:
+        """异步拉取（同步库在线程池执行，20s 超时防单只查询挂起拖垮整体）"""
+        try:
+            return await asyncio.wait_for(
+                asyncio.to_thread(
+                    BaoStockKline._fetch_sync, code, period, limit, start_date, end_date),
+                timeout=20.0)
+        except Exception:
+            return []
+
+
+# ---------------------------------------------------------------------------
 # 东方财富K线
 # ---------------------------------------------------------------------------
 
@@ -280,14 +386,15 @@ class EastmoneyKline:
     @staticmethod
     async def fetch_kline(
         code: str, period: str = "daily", limit: int = 300,
-        client: Optional[httpx.AsyncClient] = None,
+        client: Optional[httpx.AsyncClient] = None, start_date: str = "",
     ) -> List[dict]:
         """拉取K线。返回 [{ts, open, close, high, low, volume, amount}]（按时间升序）
-        东财失败时自动重试一次；连续失败触发熔断后由调用方改走腾讯源"""
+        东财失败时自动重试一次；连续失败触发熔断后由调用方改走腾讯源
+        start_date: 可选起始日期 YYYY-MM-DD，替代按 limit 反推"""
         if not em_available():
             return []
         for attempt in range(2):
-            data = await EastmoneyKline._fetch_once(code, period, limit, client)
+            data = await EastmoneyKline._fetch_once(code, period, limit, client, start_date)
             if data:
                 em_record(True)
                 return data
@@ -298,14 +405,17 @@ class EastmoneyKline:
     @staticmethod
     async def _fetch_once(
         code: str, period: str = "daily", limit: int = 300,
-        client: Optional[httpx.AsyncClient] = None,
+        client: Optional[httpx.AsyncClient] = None, start_date: str = "",
     ) -> List[dict]:
         klt = PERIOD_KLINES.get(period)
         if klt is None:
             return []
-        # beg=0 会返回全部历史导致首次加载过慢，按需拉取最近若干天
-        days = limit * 2 if klt >= 101 else limit // 4 + 1
-        beg_date = (time.strftime("%Y%m%d", time.localtime(time.time() - days * 86400)))
+        # beg 指定起始日期；否则按需拉取最近若干天
+        if start_date:
+            beg_date = start_date.replace("-", "")
+        else:
+            days = limit * 2 if klt >= 101 else limit // 4 + 1
+            beg_date = (time.strftime("%Y%m%d", time.localtime(time.time() - days * 86400)))
         _, secid = code_to_market(code)
         params = {
             "secid": secid,
@@ -346,6 +456,41 @@ class EastmoneyKline:
             except ValueError:
                 continue
         return out
+
+
+# ---------------------------------------------------------------------------
+# 东财搜索建议（代码/名称/拼音）
+# ---------------------------------------------------------------------------
+
+EM_SUGGEST_URL = "https://searchapi.eastmoney.com/api/suggest/get"
+EM_SUGGEST_TOKEN = "D43BF722C8E33BDC906FB84D85E326E8"
+
+
+class EastmoneySuggest:
+    """东财搜索建议：按代码/名称/拼音搜索A股（沪深+北交所），返回 [(code, name)]"""
+
+    @staticmethod
+    async def search(q: str, client: Optional[httpx.AsyncClient] = None) -> List[Tuple[str, str]]:
+        params = {"input": q, "type": 14, "token": EM_SUGGEST_TOKEN}
+        headers = {"User-Agent": "Mozilla/5.0", "Referer": "https://quote.eastmoney.com/"}
+        try:
+            if client is None:
+                async with httpx.AsyncClient(timeout=8.0, headers=headers) as c:
+                    resp = await c.get(EM_SUGGEST_URL, params=params)
+            else:
+                resp = await client.get(EM_SUGGEST_URL, params=params)
+            data = ((resp.json() or {}).get("QuotationCodeTable") or {}).get("Data") or []
+            out = []
+            for d in data:
+                if d.get("Classify") not in ("AStock", "NEEQ"):
+                    continue
+                code = str(d.get("Code") or "").strip()
+                name = str(d.get("Name") or "").strip()
+                if code and name:
+                    out.append((code, name))
+            return out
+        except Exception:
+            return []
 
 
 # ---------------------------------------------------------------------------
@@ -431,15 +576,26 @@ class DataSource:
     async def snapshots(self, codes: List[str]) -> Dict[str, dict]:
         return await TencentQuote.fetch(codes, client=self.client)
 
-    async def kline(self, code: str, period: str = "daily", limit: int = 300) -> List[dict]:
-        """K线获取：优先东财，失败/为空切腾讯；日K再失败则兑底新浪"""
-        data = await EastmoneyKline.fetch_kline(code, period, limit, client=self.client)
-        if data:
-            return data
-        data = await TencentKline.fetch_kline(code, period, limit, client=self.client)
-        if data:
-            return data
-        return await SinaKline.fetch_kline(code, period, limit, client=self.client)
+    async def kline(self, code: str, period: str = "daily", limit: int = 300,
+                    min_len: int = 0, start_date: str = "", end_date: str = "") -> List[dict]:
+        """K线获取：东财 → 腾讯 → 新浪 → BaoStock 逐级降级。
+        min_len：期望返回根数，某级返回不足时继续降级（末级返回已有数据）
+        start_date/end_date：可选精确区间（YYYY-MM-DD），供长历史回测使用"""
+        chain = [
+            EastmoneyKline.fetch_kline(code, period, limit, client=self.client,
+                                       start_date=start_date),
+            TencentKline.fetch_kline(code, period, limit, client=self.client),
+            SinaKline.fetch_kline(code, period, limit, client=self.client),
+            BaoStockKline.fetch_kline(code, period, limit,
+                                      start_date=start_date, end_date=end_date),
+        ]
+        for i, fut in enumerate(chain):
+            data = await fut
+            if data and (len(data) >= min_len or i == len(chain) - 1):
+                return data
+            if i == len(chain) - 1:
+                return data or []
+        return []
 
     async def hs300(self) -> List[Tuple[str, str]]:
         return await EastmoneyPool.fetch_hs300(client=self.client)
@@ -447,15 +603,21 @@ class DataSource:
     async def all_stocks(self) -> List[Tuple[str, str]]:
         return await EastmoneyPool.fetch_all(client=self.client)
 
+    async def search(self, q: str) -> List[Tuple[str, str]]:
+        """按代码/名称/拼音搜索股票（沪深+北交所），失败返回空列表"""
+        return await EastmoneySuggest.search(q, client=self.client)
+
     async def fetch_many_kline(self, codes: List[str], period: str, limit: int,
-                               concurrency: int = 10) -> Dict[str, List[dict]]:
+                               concurrency: int = 10, min_len: int = 0,
+                               start_date: str = "", end_date: str = "") -> Dict[str, List[dict]]:
         """并发拉取多只股票K线"""
         sem = asyncio.Semaphore(concurrency)
         results: Dict[str, List[dict]] = {}
 
         async def one(code: str):
             async with sem:
-                data = await self.kline(code, period, limit)
+                data = await self.kline(code, period, limit, min_len=min_len,
+                                        start_date=start_date, end_date=end_date)
                 if data:
                     results[code] = data
 

@@ -115,11 +115,59 @@ async def pool():
     return {"stocks": [{"code": c, "name": n} for c, n in store.get_stocks()]}
 
 
+@app.get("/api/search")
+async def search_stock(q: str, limit: int = 10):
+    """按代码或名称搜索股票：本地股票池/自选优先，其次东财在线搜索（代码/名称/拼音）"""
+    q = q.strip()
+    if not q:
+        return {"ok": True, "items": []}
+
+    local = {c: n for c, n in store.get_stocks()}
+    for c, n in store.get_watch():
+        local.setdefault(c, n)
+
+    items, seen = [], set()
+
+    def add(code, name, source):
+        if code in seen:
+            return
+        seen.add(code)
+        items.append({"code": code, "name": name, "source": source})
+
+    # 本地池：代码前缀匹配；名称/拼音包含匹配
+    if q.isdigit():
+        for code, name in local.items():
+            if code.startswith(q):
+                add(code, name, "local")
+    else:
+        for code, name in local.items():
+            if q in name:
+                add(code, name, "local")
+    # 在线搜索：东财 suggest（沪深+北交所），结果按相关度排序
+    for code, name in await ds.search(q):
+        add(code, name, "market")
+    return {"ok": True, "items": items[:limit]}
+
+
+async def resolve_code(q: str):
+    """把代码或名称解析为6位代码；名称取第一个匹配，失败返回 None"""
+    q = q.strip()
+    if not q:
+        return None
+    if q.isdigit():
+        return q
+    items = (await search_stock(q, limit=1))["items"]
+    return items[0]["code"] if items else None
+
+
 @app.post("/api/pool")
 async def add_pool(req: dict):
-    code = str(req.get("code", "")).strip()
+    q = str(req.get("code", "")).strip()
+    if not q:
+        return {"ok": False, "msg": "请输入股票代码或名称"}
+    code = await resolve_code(q)
     if not code:
-        return {"ok": False, "msg": "缺少股票代码"}
+        return {"ok": False, "msg": f"未找到“{q}”，请检查代码或名称"}
     snap = (await ds.snapshots([code])).get(code)
     if not snap:
         return {"ok": False, "msg": f"代码 {code} 行情获取失败，请确认是有效的A股代码"}
@@ -147,9 +195,12 @@ async def get_watch():
 
 @app.post("/api/watch")
 async def add_watch(req: dict):
-    code = str(req.get("code", "")).strip()
+    q = str(req.get("code", "")).strip()
+    if not q:
+        return {"ok": False, "msg": "请输入股票代码或名称"}
+    code = await resolve_code(q)
     if not code:
-        return {"ok": False, "msg": "请输入股票代码"}
+        return {"ok": False, "msg": f"未找到“{q}”，请检查代码或名称"}
     snap = (await ds.snapshots([code])).get(code)
     if not snap:
         return {"ok": False, "msg": f"代码 {code} 行情获取失败，请确认是有效的A股代码"}
