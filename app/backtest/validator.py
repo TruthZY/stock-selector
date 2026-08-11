@@ -337,12 +337,13 @@ class Validator:
     # ------------------------- 买入质量 -------------------------
 
     def _compute_buy_quality(self) -> dict:
-        """买入质量指标（回溯持仓区间K线）：
-        1. 次日盈利率：买入后下一交易日收盘价 > 买入实际价（含滑点）的比例
-        2. 期间浮盈率：买入次日（不含买入当天）起至卖出前最高价达到 +2% 的比例
-        两者显著高于胜率 => 卖出时机偏早（买对了但卖早了）"""
-        next_win = next_total = 0
-        gain2_win = 0
+        """买入质量指标（回溯持仓区间K线），按两种口径分别统计「次日」与「期间」：
+        A. 盘中盈利：存在K线最高价达到买入价 +2%（K线维度盘中触及）
+        B. 收盘盈利：以交易日收盘价（当日最后一根K线）计，存在 > 买入价
+        分母统一为"有次日K线的笔数"，指标间可直接对比；
+        显著高于胜率 => 卖出时机偏早（买对了但卖早了）"""
+        next_gain2_win = next_win = next_total = 0   # 次日：A 盘中+2%；B 收盘盈利
+        gain2_win = close_win = 0                    # 期间：A 盘中+2%；B 存在日收盘盈利
         for t in self.trades:
             bars = self.bars_map.get(t["code"]) or []
             if not bars:
@@ -353,30 +354,45 @@ class Validator:
             if bi is None:
                 continue
             bp = t["buy_price"]
-            # 1. 次日盈利：买入后第一个不同交易日的收盘价
-            nxt = next((k for k in bars[bi + 1:]
-                        if k["ts"][:10] != t["buy_ts"][:10]), None)
-            if nxt is not None:
-                next_total += 1
-                if nxt["close"] > bp:
-                    next_win += 1
-            # 2. 期间曾达 +2% 浮盈：买入次日（不含买入当天）至卖出根（含）的最高价
-            if si is not None and si > bi:
-                start = bi + 1
-                while start <= si and bars[start]["ts"][:10] == t["buy_ts"][:10]:
-                    start += 1
-                seg = bars[start:si + 1]
-                if seg and any(k["high"] >= bp * (1 + self.QUALITY_GAIN_PCT / 100.0)
-                               for k in seg):
+            # 次日第一根K线（跳过买入当天剩余K线）
+            bi_next = bi + 1
+            while bi_next < len(bars) and bars[bi_next]["ts"][:10] == t["buy_ts"][:10]:
+                bi_next += 1
+            if bi_next >= len(bars):
+                continue    # 无次日K线（如最后一根K线买入）：指标不计入分母
+            next_total += 1
+            day = bars[bi_next]["ts"][:10]
+            ei_next = bi_next + 1
+            while ei_next < len(bars) and bars[ei_next]["ts"][:10] == day:
+                ei_next += 1
+            thr = bp * (1 + self.QUALITY_GAIN_PCT / 100.0)
+            # 次日：A 任意K线盘中触及 +2%；B 当日收盘价（最后一根K线）盈利
+            if any(k["high"] >= thr for k in bars[bi_next:ei_next]):
+                next_gain2_win += 1
+            if bars[ei_next - 1]["close"] > bp:
+                next_win += 1
+            # 期间：次日（含）至卖出根（含）
+            if si is not None and si >= bi_next:
+                seg = bars[bi_next:si + 1]
+                if any(k["high"] >= thr for k in seg):
                     gain2_win += 1
+                day_close = {k["ts"][:10]: k["close"] for k in seg}   # 每日收盘价（末根K线）
+                if any(c > bp for c in day_close.values()):
+                    close_win += 1
         return {
+            "next_day_gain2_count": next_gain2_win,
+            "next_day_gain2_rate_pct": (round(next_gain2_win / next_total * 100.0, 2)
+                                         if next_total else None),
             "next_day_win_count": next_win,
             "next_day_total": next_total,
             "next_day_win_rate_pct": (round(next_win / next_total * 100.0, 2)
                                        if next_total else None),
             "max_gain2_count": gain2_win,
-            "max_gain2_rate_pct": (round(gain2_win / len(self.trades) * 100.0, 2)
-                                    if self.trades else None),
+            "max_gain2_rate_pct": (round(gain2_win / next_total * 100.0, 2)
+                                    if next_total else None),
+            "max_close_win_count": close_win,
+            "max_close_win_rate_pct": (round(close_win / next_total * 100.0, 2)
+                                        if next_total else None),
         }
 
     # ------------------------- 结果 -------------------------
