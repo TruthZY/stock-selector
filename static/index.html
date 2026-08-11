@@ -1,0 +1,847 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>实时选股系统</title>
+<script src="/static/echarts.min.js"></script>
+<style>
+  :root {
+    --bg: #0d1117; --panel: #161b22; --border: #21262d; --text: #e6edf3;
+    --muted: #8b949e; --up: #ef232a; --down: #14b143; --accent: #58a6ff;
+    --warn: #d29922;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { background: var(--bg); color: var(--text); font: 13px/1.5 "Microsoft YaHei", sans-serif; }
+  header {
+    display: flex; align-items: center; gap: 16px; flex-wrap: wrap;
+    padding: 10px 16px; background: var(--panel); border-bottom: 1px solid var(--border);
+  }
+  header h1 { font-size: 16px; margin-right: 8px; }
+  .status-dot { width: 9px; height: 9px; border-radius: 50%; display: inline-block; }
+  .dot-ok { background: #3fb950; box-shadow: 0 0 6px #3fb950; }
+  .dot-err { background: var(--up); box-shadow: 0 0 6px var(--up); }
+  .dot-off { background: var(--muted); }
+  .muted { color: var(--muted); }
+  #statusMsg { color: var(--muted); }
+  .strat-chip {
+    padding: 3px 10px; border-radius: 12px; cursor: pointer; user-select: none;
+    border: 1px solid var(--border); color: var(--muted); background: transparent;
+    transition: all .15s;
+  }
+  .strat-chip.on { color: var(--accent); border-color: var(--accent); background: rgba(88,166,255,.12); }
+  .add-box { display: flex; gap: 6px; margin-left: auto; }
+  .add-box input {
+    width: 130px; padding: 4px 8px; border-radius: 6px; border: 1px solid var(--border);
+    background: var(--bg); color: var(--text); outline: none;
+  }
+  button {
+    padding: 4px 12px; border-radius: 6px; border: 1px solid var(--border);
+    background: var(--panel); color: var(--text); cursor: pointer;
+  }
+  button:hover { border-color: var(--accent); color: var(--accent); }
+  main { display: flex; height: calc(100vh - 50px); }
+  aside {
+    width: 420px; min-width: 280px; border-right: 1px solid var(--border);
+    display: flex; flex-direction: column; background: var(--panel);
+  }
+  .divider-v {
+    width: 4px; cursor: col-resize; flex-shrink: 0; background: var(--border);
+    transition: background .15s;
+  }
+  .divider-v:hover, .divider-v.active { background: var(--accent); }
+  .divider-h {
+    height: 4px; cursor: row-resize; flex-shrink: 0; background: var(--border);
+    transition: background .15s;
+  }
+  .divider-h:hover, .divider-h.active { background: var(--accent); }
+  body.dragging { user-select: none; cursor: inherit; }
+  body.dragging #chart { pointer-events: none; }
+  .table-wrap { flex: 1; overflow-y: auto; }
+  table { width: 100%; border-collapse: collapse; }
+  th {
+    position: sticky; top: 0; background: var(--panel); z-index: 2;
+    text-align: right; padding: 6px 8px; font-weight: 600; color: var(--muted);
+    border-bottom: 1px solid var(--border); cursor: pointer; white-space: nowrap;
+  }
+  th:first-child { text-align: left; }
+  td { padding: 5px 8px; text-align: right; border-bottom: 1px solid #1a1f26; white-space: nowrap; }
+  td:first-child { text-align: left; }
+  tr { cursor: pointer; }
+  tr:hover { background: #1c2330; }
+  tr.sel { background: rgba(88,166,255,.14); }
+  .up { color: var(--up); } .down { color: var(--down); } .flat { color: var(--muted); }
+  .badge {
+    display: inline-block; padding: 1px 6px; margin-left: 3px; font-size: 11px;
+    border-radius: 8px; border: 1px solid;
+  }
+  .b-ma { color: #d2a8ff; border-color: #d2a8ff; }
+  .b-vol { color: #7ee787; border-color: #7ee787; }
+  .b-up { color: var(--up); border-color: var(--up); }
+  .b-pe { color: #79c0ff; border-color: #79c0ff; }
+  .b-rsi { color: var(--warn); border-color: var(--warn); }
+  section { flex: 1; display: flex; flex-direction: column; min-width: 0; }
+  .chart-head {
+    display: flex; align-items: center; gap: 8px; padding: 8px 12px;
+    border-bottom: 1px solid var(--border);
+  }
+  #stockTitle { font-size: 15px; font-weight: 600; }
+  #stockInfo { color: var(--muted); font-size: 12px; }
+  .period-btn {
+    padding: 2px 10px; border-radius: 10px; border: 1px solid var(--border);
+    background: transparent; color: var(--muted); cursor: pointer; font-size: 12px;
+  }
+  .period-btn.on { color: var(--accent); border-color: var(--accent); background: rgba(88,166,255,.12); }
+  #chart { flex: 1; min-height: 0; }
+  .signals-panel {
+    height: 230px; min-height: 120px; display: flex; flex-direction: column;
+  }
+  .signals-panel h3 { padding: 6px 12px; font-size: 13px; color: var(--muted); border-bottom: 1px solid var(--border); }
+  #signalList { flex: 1; overflow-y: auto; }
+  .panel-tabs { display: flex; border-bottom: 1px solid var(--border); }
+  .panel-tab {
+    padding: 6px 16px; font-size: 13px; color: var(--muted); cursor: pointer;
+    border-bottom: 2px solid transparent; user-select: none;
+  }
+  .panel-tab.on { color: var(--accent); border-bottom-color: var(--accent); }
+  .aside-tabs { display: flex; border-bottom: 1px solid var(--border); }
+  .aside-tab {
+    padding: 6px 16px; font-size: 13px; color: var(--muted); cursor: pointer;
+    border-bottom: 2px solid transparent; user-select: none;
+  }
+  .aside-tab.on { color: var(--accent); border-bottom-color: var(--accent); }
+  .star { color: var(--muted); cursor: pointer; }
+  .star.on { color: var(--warn); }
+  .scan-bar {
+    display: flex; gap: 6px; align-items: center; flex-wrap: wrap;
+    padding: 6px 12px; border-bottom: 1px solid #1a1f26;
+  }
+  .scan-bar select {
+    background: var(--bg); color: var(--text); border: 1px solid var(--border);
+    border-radius: 6px; padding: 3px 6px; outline: none;
+  }
+  #scanList { flex: 1; overflow-y: auto; }
+  .scan-item {
+    display: flex; gap: 10px; align-items: center; padding: 5px 12px;
+    border-bottom: 1px solid #1a1f26; font-size: 12px; cursor: pointer;
+  }
+  .scan-item:hover { background: #1c2330; }
+  .sig {
+    display: flex; gap: 8px; align-items: center; padding: 4px 12px;
+    border-bottom: 1px solid #1a1f26; font-size: 12px;
+  }
+  .sig.flash { background: rgba(210,168,255,.18); }
+  .sig .code { color: var(--accent); cursor: pointer; }
+  .sig .strat { color: #d2a8ff; }
+  .sig .reason { color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .empty { color: var(--muted); text-align: center; padding: 40px 0; }
+  ::-webkit-scrollbar { width: 8px; height: 8px; }
+  ::-webkit-scrollbar-thumb { background: #30363d; border-radius: 4px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>📈 实时选股系统</h1>
+  <span class="status-dot dot-off" id="connDot"></span>
+  <span id="connText" class="muted">未连接</span>
+  <span class="muted">|</span>
+  <span id="tradingText" class="muted">--</span>
+  <span class="muted">|</span>
+  <span id="updateText" class="muted">--</span>
+  <span class="muted">|</span>
+  <span id="statusMsg">加载中…</span>
+  <span id="stratBar" style="display:flex;gap:6px;flex-wrap:wrap;"></span>
+  <div class="add-box">
+    <input id="addCode" placeholder="代码 如 600519" />
+    <button onclick="addStock()">加股票池</button>
+    <button onclick="addWatch()">☆ 加自选</button>
+  </div>
+</header>
+<main>
+  <aside>
+    <div class="aside-tabs">
+      <span class="aside-tab on" id="tabAll" onclick="setView('all')">📊 股票池<span id="poolCount"></span></span>
+      <span class="aside-tab" id="tabWatch" onclick="setView('watch')">★ 自选<span id="watchCount"></span></span>
+    </div>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th style="width:24px"></th><th data-k="code">代码</th><th data-k="name">名称</th>
+            <th data-k="price" data-dir="-1">现价</th><th data-k="change_pct" data-dir="-1">涨跌%</th>
+            <th data-k="volume_ratio" data-dir="-1">量比</th><th>信号</th>
+          </tr>
+        </thead>
+        <tbody id="stockBody"></tbody>
+      </table>
+    </div>
+  </aside>
+  <div class="divider-v" id="vSplit" title="拖动调整宽度"></div>
+  <section>
+    <div class="chart-head">
+      <span id="stockTitle">请选择股票</span>
+      <span id="stockInfo"></span>
+      <span style="flex:1"></span>
+      <span class="period-btn on" data-p="daily" onclick="setPeriod('daily')">日K</span>
+      <span class="period-btn" data-p="60m" onclick="setPeriod('60m')">60分</span>
+      <span class="period-btn" data-p="30m" onclick="setPeriod('30m')">30分</span>
+      <span class="period-btn" data-p="15m" onclick="setPeriod('15m')">15分</span>
+      <span class="period-btn" data-p="5m" onclick="setPeriod('5m')">5分</span>
+      <span class="period-btn" data-p="1m" onclick="setPeriod('1m')">1分</span>
+    </div>
+    <div id="chart"><div class="empty">左侧选择一只股票查看实时K线</div></div>
+    <div class="divider-h" id="hSplit" title="拖动调整高度"></div>
+    <div class="signals-panel">
+      <div class="panel-tabs">
+        <span class="panel-tab on" id="tabSignals" onclick="switchPanel('signals')">🛎 实时信号</span>
+        <span class="panel-tab" id="tabScan" onclick="switchPanel('scan')">🔍 形态筛选</span>
+      </div>
+      <div id="signalPanel" style="flex:1;display:flex;flex-direction:column;min-height:0">
+        <div id="signalList"></div>
+      </div>
+      <div id="scanPanel" style="display:none;flex:1;flex-direction:column;min-height:0">
+        <div class="scan-bar">
+          <select id="scanPattern"></select>
+          <select id="scanPeriod">
+            <option value="30m" selected>30分</option>
+            <option value="60m">60分</option>
+            <option value="15m">15分</option>
+            <option value="5m">5分</option>
+            <option value="daily">日K</option>
+          </select>
+          <select id="scanWindow">
+            <option value="3">最后3根</option>
+            <option value="5" selected>最后5根</option>
+            <option value="8">最后8根</option>
+          </select>
+          <select id="scanDay">
+            <option value="latest" selected>最近交易日</option>
+            <option value="today">仅今天</option>
+            <option value="prev">前一天</option>
+          </select>
+          <select id="scanScope">
+            <option value="pool" selected>股票池</option>
+            <option value="all">全市场</option>
+          </select>
+          <select id="scanTrend" onchange="applyTrendFilter()" title="按形态出现前5根K线的趋势过滤">
+            <option value="all" selected>任意趋势</option>
+            <option value="up">↑ 上升</option>
+            <option value="down">↓ 下降</option>
+            <option value="flat">→ 平稳</option>
+          </select>
+          <button onclick="runScan()">查询</button>
+          <span id="scanMsg" class="muted"></span>
+        </div>
+        <div id="scanList"></div>
+      </div>
+    </div>
+  </section>
+</main>
+
+<script>
+// ---------------------------------------------------------------------------
+// 全局状态
+// ---------------------------------------------------------------------------
+const PERIOD_LABEL = { daily: "日K", "60m": "60分", "30m": "30分", "15m": "15分", "5m": "5分", "1m": "1分" };
+const BADGE_CLASS = { ma_bull: "b-ma", ma_golden_cross: "b-ma", macd_golden: "b-ma",
+  volume_breakout: "b-vol", strong_up: "b-up", limit_up: "b-up", rsi_oversold: "b-rsi", low_pe: "b-pe" };
+const STRAT_COLOR = { ma_bull: "#d2a8ff", ma_golden_cross: "#d2a8ff", macd_golden: "#d2a8ff",
+  volume_breakout: "#7ee787", strong_up: "#ef232a", limit_up: "#ef232a",
+  rsi_oversold: "#d29922", low_pe: "#79c0ff" };
+
+let snapshots = {};        // code -> snapshot
+let signalMap = {};        // code -> {key: {name, ts}}
+let selectedCode = null;
+let currentPeriod = "daily";
+let chart = null;
+let klineTimer = null;
+let chartKey = null;
+let sortedKey = "change_pct", sortedDir = -1;
+let stratDefs = {};        // key -> {name, enabled}
+let watchSet = new Set();  // 自选股代码集合
+let viewMode = "all";      // all=股票池 watch=仅自选
+let lastScanData = null;   // 最近一次形态扫描结果（供趋势过滤本地重筛）
+
+const $ = id => document.getElementById(id);
+
+// ---------------------------------------------------------------------------
+// WebSocket
+// ---------------------------------------------------------------------------
+let ws = null;
+function connectWS() {
+  ws = new WebSocket(`ws://${location.host}/ws`);
+  ws.onopen = () => { $("connDot").className = "status-dot dot-ok"; $("connText").textContent = "已连接"; };
+  ws.onclose = () => { $("connDot").className = "status-dot dot-err"; $("connText").textContent = "已断开，重连中…"; setTimeout(connectWS, 5000); };
+  ws.onerror = () => ws.close();
+  ws.onmessage = ev => handleMsg(JSON.parse(ev.data));
+}
+
+function handleMsg(msg) {
+  const d = msg.data || {};
+  switch (msg.type) {
+    case "snapshots":
+      snapshots = {};
+      (d.snapshots || []).forEach(s => { snapshots[s.code] = s; });
+      updateHits(d.hits || []);
+      renderTable();
+      updateChartTail();
+      $("updateText").textContent = `更新 ${timeStr(d.ts)}`;
+      break;
+    case "signal":
+      addSignal(d, true);
+      // 记录持有中的信号（K线类保留30分钟，快照类由 hits 维护）
+      const sig = signalMap[d.code] || (signalMap[d.code] = {});
+      sig[d.strategy] = { name: d.strategy_name, ts: Date.now(), kind: d.strategy in {volume_breakout:1,strong_up:1,limit_up:1,rsi_oversold:1,low_pe:1} ? "snap" : "kline" };
+      renderTable();
+      if (selectedCode === d.code) {
+        // 即时标注：直接注入信号并重绘，不等 /api/kline、/api/signals 往返
+        currentSigs.unshift({ ts: d.ts, code: d.code, name: d.name, strategy: d.strategy,
+          price: d.price, change_pct: d.change_pct, reason: d.reason });
+        if (lastKlines.length) renderChart(lastKlines, currentSigs);
+        refreshKline();
+      }
+      break;
+    case "signals_history":
+      (d.signals || []).slice().reverse().forEach(s => addSignal({
+        ts: s.ts, code: s.code, name: s.name, strategy_name: strategyName(s.strategy),
+        strategy: s.strategy, price: s.price, change_pct: s.change_pct, reason: s.reason
+      }, false));
+      break;
+    case "status":
+      if (d.msg) $("statusMsg").textContent = d.msg;
+      if (d.strategies) buildStratBar(d.strategies);
+      if (d.pool_size) $("poolCount").textContent = `(${d.pool_size})`;
+      $("tradingText").textContent = d.trading ? "盘中" : "休市/盘外";
+      break;
+  }
+}
+
+function strategyName(key) {
+  return (stratDefs[key] && stratDefs[key].name) || key;
+}
+
+// ---------------------------------------------------------------------------
+// 策略开关
+// ---------------------------------------------------------------------------
+function buildStratBar(strats) {
+  stratDefs = {};
+  const bar = $("stratBar");
+  bar.innerHTML = "";
+  strats.forEach(s => {
+    stratDefs[s.key] = s;
+    const chip = document.createElement("span");
+    chip.className = "strat-chip" + (s.enabled ? " on" : "");
+    chip.textContent = s.name;
+    chip.title = s.desc;
+    chip.onclick = async () => {
+      const on = !s.enabled;
+      s.enabled = on;
+      chip.className = "strat-chip" + (on ? " on" : "");
+      await fetch("/api/strategies/toggle", { method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ key: s.key, enabled: on }) });
+    };
+    bar.appendChild(chip);
+  });
+}
+
+// ---------------------------------------------------------------------------
+// 股票表格
+// ---------------------------------------------------------------------------
+function renderTable() {
+  const body = $("stockBody");
+  let list = Object.values(snapshots);
+  if (viewMode === "watch") list = list.filter(s => watchSet.has(s.code));
+  list.sort((a, b) => {
+    let va = a[sortedKey], vb = b[sortedKey];
+    if (va == null) va = -1e9; if (vb == null) vb = -1e9;
+    return (va - vb) * sortedDir;
+  });
+  body.innerHTML = "";
+  if (!list.length) {
+    body.innerHTML = `<tr><td colspan="7" class="empty">${viewMode === "watch"
+      ? "暂无自选股：在顶部输入代码，点“☆ 加自选”添加" : "暂无数据"}</td></tr>`;
+    return;
+  }
+  list.forEach(s => {
+    const tr = document.createElement("tr");
+    if (s.code === selectedCode) tr.className = "sel";
+    const pct = s.change_pct || 0;
+    const cls = pct > 0 ? "up" : pct < 0 ? "down" : "flat";
+    const watched = watchSet.has(s.code);
+    const badges = Object.entries(signalMap[s.code] || {})
+      .map(([k, v]) => `<span class="badge ${BADGE_CLASS[k] || 'b-ma'}">${v.name}</span>`).join("");
+    tr.innerHTML =
+      `<td style="text-align:center" class="star${watched ? ' on' : ''}" title="${watched ? '移出自选' : '加入自选'}">${watched ? '★' : '☆'}</td>` +
+      `<td>${s.code}</td><td>${s.name}</td>` +
+      `<td class="${cls}">${fmt(s.price, 2)}</td>` +
+      `<td class="${cls}">${pct > 0 ? '+' : ''}${pct.toFixed(2)}%</td>` +
+      `<td>${fmt(s.volume_ratio, 2)}</td>` +
+      `<td style="text-align:left">${badges}</td>`;
+    tr.cells[0].onclick = e => { e.stopPropagation(); toggleWatch(s.code); };
+    tr.onclick = () => selectStock(s.code);
+    body.appendChild(tr);
+  });
+}
+
+function updateHits(hits) {
+  const now = Date.now();
+  const snapKeys = { volume_breakout: 1, strong_up: 1, limit_up: 1, rsi_oversold: 1, low_pe: 1 };
+  const hitNow = new Set(hits.map(h => `${h.code}:${h.strategy}`));
+  for (const code in signalMap) {
+    for (const key in signalMap[code]) {
+      const v = signalMap[code][key];
+      const isSnap = key in snapKeys;
+      const present = hitNow.has(`${code}:${key}`);
+      const ttl = isSnap ? 90 * 1000 : 30 * 60 * 1000;
+      if (isSnap && !present && now - v.ts > 60 * 1000) delete signalMap[code][key];
+      if (now - v.ts > ttl) delete signalMap[code][key];
+    }
+    if (!Object.keys(signalMap[code]).length) delete signalMap[code];
+  }
+}
+
+// ---------------------------------------------------------------------------
+// K线图
+// ---------------------------------------------------------------------------
+function selectStock(code) {
+  selectedCode = code;
+  lastKlines = [];   // 清空旧数据，避免新信号标到上一只股票的图上
+  currentSigs = [];
+  renderTable();
+  refreshKline();
+}
+
+function setPeriod(p) {
+  currentPeriod = p;
+  chartKey = null; // 切换周期后重置缩放记忆，新周期从最新K线看起
+  lastKlines = [];   // 周期切换后旧周期数据失效
+  currentSigs = [];
+  document.querySelectorAll(".period-btn").forEach(b => b.className = "period-btn" + (b.dataset.p === p ? " on" : ""));
+  if (selectedCode) $("stockInfo").textContent = `⏳ 加载 ${PERIOD_LABEL[p] || p} K线…`;
+  refreshKline();
+}
+
+async function refreshKline() {
+  if (!selectedCode) return;
+  const s = snapshots[selectedCode] || {};
+  $("stockTitle").textContent = `${s.name || ''} ${selectedCode}`;
+  $("stockInfo").textContent = s.price ? `现价 ${fmt(s.price, 2)}  涨跌 ${fmt(s.change_pct, 2)}%  量比 ${fmt(s.volume_ratio, 2)}  换手 ${fmt(s.turnover, 2)}%` : "";
+  try {
+    const [r, rs] = await Promise.all([
+      fetch(`/api/kline?code=${selectedCode}&period=${currentPeriod}&limit=250`),
+      fetch(`/api/signals?code=${selectedCode}&limit=200`),
+    ]);
+    const data = await r.json();
+    const sd = await rs.json().catch(() => ({ signals: [] }));
+    if (selectedCode === (data.code || selectedCode)) renderChart(data.klines || [], sd.signals || []);
+  } catch (e) { /* 忽略 */ }
+  if (klineTimer) clearTimeout(klineTimer);
+  klineTimer = setTimeout(refreshKline, 20 * 1000); // 20秒自动刷新
+}
+
+function updateChartTail() {
+  // 选中股票的K线数据由定时刷新拉取，此处仅更新标题行情信息
+  if (!selectedCode) return;
+  const s = snapshots[selectedCode];
+  if (s) $("stockInfo").textContent =
+    `现价 ${fmt(s.price, 2)}  涨跌 ${fmt(s.change_pct, 2)}%  量比 ${fmt(s.volume_ratio, 2)}  换手 ${fmt(s.turnover, 2)}%`;
+}
+
+// MA / MACD 计算（与后端一致）
+function calcMA(arr, n) {
+  const out = new Array(arr.length).fill(null);
+  if (arr.length < n) return out;
+  let s = 0;
+  for (let i = 0; i < n; i++) s += arr[i];
+  out[n - 1] = s / n;
+  for (let i = n; i < arr.length; i++) { s += arr[i] - arr[i - n]; out[i] = s / n; }
+  return out;
+}
+function calcEMA(arr, n) {
+  const out = []; if (!arr.length) return out;
+  let prev = arr[0], k = 2 / (n + 1); out.push(prev);
+  for (let i = 1; i < arr.length; i++) { prev = arr[i] * k + prev * (1 - k); out.push(prev); }
+  return out;
+}
+function calcMACD(closes) {
+  const ef = calcEMA(closes, 12), es = calcEMA(closes, 26);
+  const dif = closes.map((_, i) => ef[i] - es[i]);
+  const dea = calcEMA(dif, 9);
+  const hist = dif.map((d, i) => 2 * (d - dea[i]));
+  return { dif, dea, hist };
+}
+
+let lastKlines = [];       // 当前图表K线数据（信号推送时用于即时重绘，不等网络请求）
+let currentSigs = [];      // 当前股票的信号列表
+
+// 信号 → K线索引匹配：优先从 reason 提取实际K线时间（如"@2026-08-10"），
+// 否则用信号触发时间；日K按日期，分钟K按时间区间（K线ts为结束时间）
+function buildSignalMarks(klines, sigs) {
+  const marks = [];
+  const stacked = {};   // 同一根K线多个信号时横向错开
+  sigs.forEach(s => {
+    const rm = (s.reason || "").match(/(\d{4}-\d{2}-\d{2})(?: (\d{2}:\d{2}))?/);
+    const sigDay = rm ? rm[1] : s.ts.slice(0, 10);
+    const sigTime = rm ? rm[2] || null : s.ts.slice(11, 16);
+    let idx = -1;
+    if (currentPeriod === "daily") {
+      idx = klines.findIndex(k => k.ts.slice(0, 10) === sigDay);
+    } else if (sigTime) {
+      for (let i = 0; i < klines.length; i++) {
+        if (klines[i].ts.slice(0, 10) !== sigDay) continue;
+        if (klines[i].ts.slice(11, 16) >= sigTime) { idx = i; break; }
+      }
+      if (idx < 0) { // 盘后触发的信号归到当日最后一根
+        for (let i = klines.length - 1; i >= 0; i--) {
+          if (klines[i].ts.slice(0, 10) === sigDay) { idx = i; break; }
+        }
+      }
+    } else {
+      // 日K类策略信号在分钟图查看 → 归到对应交易日最后一根
+      for (let i = klines.length - 1; i >= 0; i--) {
+        if (klines[i].ts.slice(0, 10) === sigDay) { idx = i; break; }
+      }
+    }
+    if (idx < 0) return;
+    const off = (stacked[idx] || 0) * 20;
+    stacked[idx] = (stacked[idx] || 0) + 1;
+    marks.push({
+      coord: [idx, klines[idx].high],
+      symbolOffset: [off, 0],
+      short: strategyName(s.strategy).slice(0, 2),
+      itemStyle: { color: STRAT_COLOR[s.strategy] || "#d2a8ff" },
+      sig: s,
+    });
+  });
+  return marks;
+}
+
+function renderChart(klines, sigs) {
+  if (!klines || !klines.length) return;
+  lastKlines = klines;
+  currentSigs = sigs || [];
+  if (!chart) chart = echarts.init($("chart"));
+  const dates = klines.map(k => k.ts);
+  const kdata = klines.map(k => [k.open, k.close, k.low, k.high]);
+  const vols = klines.map(k => k.volume);
+  const closes = klines.map(k => k.close);
+  const ma5 = calcMA(closes, 5), ma10 = calcMA(closes, 10), ma20 = calcMA(closes, 20), ma60 = calcMA(closes, 60);
+  const { dif, dea, hist } = calcMACD(closes);
+
+  const n = klines.length, show = Math.min(n, 140);
+  let startPct = Math.max(0, 100 - show / n * 100);
+  let endPct = 100;
+  const key = selectedCode + ":" + currentPeriod;
+  if (chartKey === key && chart.getOption().dataZoom) {
+    // 同股票同周期定时刷新：用户若缩放到历史区域则保留视图，否则跟随最新
+    const dz = chart.getOption().dataZoom[0];
+    if (dz.end < 99) { startPct = dz.start; endPct = dz.end; }
+  }
+  chartKey = key;
+  const upColor = "#ef232a", dnColor = "#14b143";
+  const volColors = vols.map((v, i) => closes[i] >= klines[i].open ? upColor : dnColor);
+  const histColors = hist.map(v => v >= 0 ? upColor : dnColor);
+  const grid = (top, h) => ({ left: 56, right: 16, top, height: h });
+
+  chart.setOption({
+    animation: false,
+    backgroundColor: "#0d1117",
+    axisPointer: { link: [{ xAxisIndex: "all" }], label: { backgroundColor: "#30363d" } },
+    tooltip: { trigger: "axis", axisPointer: { type: "cross" },
+      backgroundColor: "#161b22", borderColor: "#30363d", textStyle: { color: "#e6edf3", fontSize: 12 } },
+    legend: { data: ["K线", "MA5", "MA10", "MA20", "MA60"], top: 2, textStyle: { color: "#8b949e", fontSize: 11 } },
+    grid: [grid(30, "52%"), grid("66%", "13%"), grid("83%", "14%")],
+    xAxis: [
+      { type: "category", data: dates, gridIndex: 0, boundaryGap: true,
+        axisLine: { lineStyle: { color: "#30363d" } }, axisLabel: { color: "#8b949e", fontSize: 10 } },
+      { type: "category", data: dates, gridIndex: 1, axisLabel: { show: false }, axisLine: { lineStyle: { color: "#30363d" } } },
+      { type: "category", data: dates, gridIndex: 2, axisLabel: { show: false }, axisLine: { lineStyle: { color: "#30363d" } } },
+    ],
+    yAxis: [
+      { scale: true, gridIndex: 0, splitLine: { lineStyle: { color: "#1c2128" } }, axisLabel: { color: "#8b949e", fontSize: 10 } },
+      { scale: true, gridIndex: 1, splitLine: { show: false }, axisLabel: { color: "#8b949e", fontSize: 10 } },
+      { scale: true, gridIndex: 2, splitLine: { lineStyle: { color: "#1c2128" } }, axisLabel: { color: "#8b949e", fontSize: 10 } },
+    ],
+    dataZoom: [
+      { type: "inside", xAxisIndex: [0, 1, 2], start: startPct, end: endPct },
+      { type: "slider", xAxisIndex: [0, 1, 2], start: startPct, end: endPct, bottom: 2, height: 16,
+        borderColor: "#30363d", backgroundColor: "#161b22", fillerColor: "rgba(88,166,255,.15)" },
+    ],
+    series: [
+      { name: "K线", type: "candlestick", data: kdata,
+        itemStyle: { color: upColor, color0: dnColor, borderColor: upColor, borderColor0: dnColor },
+        markPoint: {
+          symbol: "pin", symbolSize: 32,
+          label: { show: true, fontSize: 9, color: "#fff", formatter: p => p.data.short },
+          tooltip: {
+            backgroundColor: "#161b22", borderColor: "#30363d",
+            textStyle: { color: "#e6edf3", fontSize: 12 },
+            formatter: p => {
+              const s = p.data.sig;
+              const pct = s.change_pct || 0;
+              return `<b style="color:${STRAT_COLOR[s.strategy] || '#d2a8ff'}">${strategyName(s.strategy)}</b><br/>`
+                + `${s.code} ${s.name || ''} · ${s.ts}<br/>`
+                + `价格 ${fmt(s.price, 2)} · ${pct > 0 ? '+' : ''}${pct.toFixed(2)}%<br/>`
+                + `${s.reason || ''}`;
+            },
+          },
+          data: buildSignalMarks(klines, sigs || []),
+        },
+      },
+      { name: "MA5", type: "line", data: ma5, symbol: "none", lineStyle: { width: 1, color: "#f7b731" } },
+      { name: "MA10", type: "line", data: ma10, symbol: "none", lineStyle: { width: 1, color: "#58a6ff" } },
+      { name: "MA20", type: "line", data: ma20, symbol: "none", lineStyle: { width: 1, color: "#d2a8ff" } },
+      { name: "MA60", type: "line", data: ma60, symbol: "none", lineStyle: { width: 1, color: "#3fb950" } },
+      { name: "成交量", type: "bar", xAxisIndex: 1, yAxisIndex: 1, data: vols,
+        itemStyle: { color: p => volColors[p.dataIndex] } },
+      { name: "DIF", type: "line", xAxisIndex: 2, yAxisIndex: 2, data: dif, symbol: "none", lineStyle: { width: 1, color: "#f7b731" } },
+      { name: "DEA", type: "line", xAxisIndex: 2, yAxisIndex: 2, data: dea, symbol: "none", lineStyle: { width: 1, color: "#58a6ff" } },
+      { name: "MACD", type: "bar", xAxisIndex: 2, yAxisIndex: 2, data: hist,
+        itemStyle: { color: p => histColors[p.dataIndex] } },
+    ],
+  }, true);
+}
+
+// ---------------------------------------------------------------------------
+// 信号列表
+// ---------------------------------------------------------------------------
+function addSignal(s, flash) {
+  const list = $("signalList");
+  const div = document.createElement("div");
+  div.className = "sig" + (flash ? " flash" : "");
+  const pct = s.change_pct || 0;
+  div.innerHTML =
+    `<span class="code" data-code="${s.code}" title="点击查看K线">${s.code}</span>` +
+    `<span>${s.name || ''}</span>` +
+    `<span class="strat">${s.strategy_name || s.strategy}</span>` +
+    `<span class="${pct > 0 ? 'up' : pct < 0 ? 'down' : 'flat'}">${pct > 0 ? '+' : ''}${pct.toFixed(2)}%</span>` +
+    `<span class="reason">${s.reason || ''}</span>` +
+    `<span class="muted" style="margin-left:auto">${s.ts}</span>`;
+  div.querySelector(".code").onclick = () => selectStock(s.code);
+  list.prepend(div);
+  while (list.children.length > 200) list.removeChild(list.lastChild);
+  if (flash) setTimeout(() => div.classList.remove("flash"), 6000);
+}
+
+// ---------------------------------------------------------------------------
+// 形态筛选（阳包阴等短线形态全池扫描）
+// ---------------------------------------------------------------------------
+function switchPanel(which) {
+  $("tabSignals").className = "panel-tab" + (which === "signals" ? " on" : "");
+  $("tabScan").className = "panel-tab" + (which === "scan" ? " on" : "");
+  $("signalPanel").style.display = which === "signals" ? "flex" : "none";
+  $("scanPanel").style.display = which === "scan" ? "flex" : "none";
+  if (which === "scan" && !$("scanPattern").options.length) initScanPatterns();
+}
+
+async function initScanPatterns() {
+  try {
+    const r = await fetch("/api/patterns");
+    const d = await r.json();
+    const sel = $("scanPattern");
+    (d.patterns || []).forEach(p => {
+      const o = document.createElement("option");
+      o.value = p.key; o.textContent = p.name; o.title = p.desc;
+      sel.appendChild(o);
+    });
+  } catch (e) { /* 忽略 */ }
+}
+
+async function runScan() {
+  $("scanMsg").textContent = $("scanScope").value === "all"
+    ? "全市场扫描中，首次约半分钟…" : "查询中…";
+  $("scanList").innerHTML = "";
+  const params = new URLSearchParams({
+    pattern: $("scanPattern").value || "yang_bao_yin",
+    period: $("scanPeriod").value,
+    window: $("scanWindow").value,
+    day: $("scanDay").value,
+    scope: $("scanScope").value,
+  });
+  try {
+    const r = await fetch("/api/scan?" + params);
+    renderScan(await r.json());
+  } catch (e) { $("scanMsg").textContent = "查询失败"; }
+}
+
+function renderScan(d) {
+  lastScanData = d;
+  drawScanList(d);
+}
+
+function applyTrendFilter() {
+  if (lastScanData) drawScanList(lastScanData);
+}
+
+const TREND_BADGE = {
+  up:   m => `<span class="up" title="形态前5根K线累计涨幅">↑上升 ${m.trend_pct > 0 ? '+' : ''}${fmt(m.trend_pct, 1)}%</span>`,
+  down: m => `<span class="down" title="形态前5根K线累计跌幅">↓下降 ${fmt(m.trend_pct, 1)}%</span>`,
+  flat: m => `<span class="muted" title="形态前5根K线波动不足1.5%">→平稳 ${fmt(m.trend_pct, 1)}%</span>`,
+};
+
+function drawScanList(d) {
+  const list = $("scanList");
+  list.innerHTML = "";
+  if (d.ok === false) { $("scanMsg").textContent = d.msg || "查询失败"; return; }
+  if (!d.matches || !d.matches.length) {
+    $("scanMsg").textContent = d.msg || (d.date ? `${d.date} 未找到符合条件的股票` : "无数据");
+    return;
+  }
+  const filter = $("scanTrend").value;
+  const matches = filter === "all" ? d.matches : d.matches.filter(m => m.trend === filter);
+  const scopeTxt = d.scope === "all" ? "全市场" : "股票池";
+  if (!matches.length) {
+    $("scanMsg").textContent = `${d.date} ${scopeTxt}命中 ${d.matches.length} 只，但无${filter === "up" ? "上升" : filter === "down" ? "下降" : "平稳"}趋势的`;
+    return;
+  }
+  const filterTxt = filter === "all" ? "" : `（已筛选 ${matches.length}/${d.matches.length}）`;
+  $("scanMsg").textContent =
+    `${d.date} ${scopeTxt}命中 ${d.matches.length} 只${filterTxt} · 扫描 ${d.scanned} 只(取到 ${d.fetched}) · ${d.elapsed_ms}ms`;
+  matches.forEach(m => {
+    const div = document.createElement("div");
+    div.className = "scan-item";
+    const pct = m.change_pct || 0;
+    const hitTimes = (m.hits || []).map(h => h.ts.slice(5)).join("，");
+    const trendHtml = (TREND_BADGE[m.trend] || TREND_BADGE.flat)(m);
+    div.innerHTML =
+      `<span style="color:var(--accent)">${m.code}</span>` +
+      `<span>${m.name || ''}</span>` +
+      `<span>${fmt(m.price, 2)}</span>` +
+      `<span class="${pct > 0 ? 'up' : pct < 0 ? 'down' : 'flat'}">${pct > 0 ? '+' : ''}${pct.toFixed(2)}%</span>` +
+      trendHtml +
+      `<span class="muted">触发：${hitTimes}</span>`;
+    div.onclick = () => {
+      selectedCode = m.code;
+      if (currentPeriod !== d.period) {
+        currentPeriod = d.period;
+        chartKey = null;
+        document.querySelectorAll(".period-btn").forEach(b =>
+          b.className = "period-btn" + (b.dataset.p === d.period ? " on" : ""));
+      }
+      renderTable();
+      refreshKline();
+    };
+    list.appendChild(div);
+  });
+}
+
+// ---------------------------------------------------------------------------
+// 自选股
+// ---------------------------------------------------------------------------
+function setView(mode) {
+  viewMode = mode;
+  $("tabAll").className = "aside-tab" + (mode === "all" ? " on" : "");
+  $("tabWatch").className = "aside-tab" + (mode === "watch" ? " on" : "");
+  renderTable();
+}
+
+function refreshWatchCount() {
+  $("watchCount").textContent = watchSet.size ? `(${watchSet.size})` : "";
+}
+
+async function loadWatch() {
+  try {
+    const [r, rp] = await Promise.all([fetch("/api/watch"), fetch("/api/pool")]);
+    const d = await r.json();
+    watchSet = new Set((d.watch || []).map(w => w.code));
+    refreshWatchCount();
+    const pd = await rp.json();
+    $("poolCount").textContent = `(${(pd.stocks || []).length})`;
+    renderTable();
+  } catch (e) { /* 忽略 */ }
+}
+
+async function toggleWatch(code) {
+  if (watchSet.has(code)) {
+    await fetch(`/api/watch/${code}`, { method: "DELETE" });
+    watchSet.delete(code);
+  } else {
+    const r = await fetch("/api/watch", { method: "POST",
+      headers: { "Content-Type": "application/json" }, body: JSON.stringify({ code }) });
+    const d = await r.json();
+    if (!d.ok) { $("statusMsg").textContent = d.msg || "加入自选失败"; return; }
+    $("statusMsg").textContent = d.msg;
+    watchSet.add(code);
+  }
+  refreshWatchCount();
+  renderTable();
+}
+
+async function addWatch() {
+  const code = $("addCode").value.trim();
+  if (!code) return;
+  $("statusMsg").textContent = `校验 ${code} …`;
+  const r = await fetch("/api/watch", { method: "POST",
+    headers: { "Content-Type": "application/json" }, body: JSON.stringify({ code }) });
+  const d = await r.json();
+  $("statusMsg").textContent = d.msg || (d.ok ? "已加入自选" : "加入失败");
+  if (d.ok) { $("addCode").value = ""; await loadWatch(); }
+}
+
+// ---------------------------------------------------------------------------
+// 添加股票 & 工具
+// ---------------------------------------------------------------------------
+async function addStock() {
+  const code = $("addCode").value.trim();
+  if (!code) return;
+  $("statusMsg").textContent = `校验 ${code} …`;
+  const r = await fetch("/api/pool", { method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ code }) });
+  const d = await r.json();
+  $("statusMsg").textContent = d.msg || "已请求添加";
+  if (d.ok) $("addCode").value = "";
+}
+
+function fmt(v, n) { return (v == null || isNaN(v)) ? "--" : Number(v).toFixed(n); }
+function timeStr(t) { if (!t) return "--"; const d = new Date(t * 1000); return d.toTimeString().slice(0, 8); }
+
+// 排序点击（表头）
+document.querySelectorAll("th[data-k]").forEach(th => th.onclick = () => {
+  const k = th.dataset.k;
+  if (sortedKey === k) sortedDir = -sortedDir; else { sortedKey = k; sortedDir = Number(th.dataset.dir || -1); }
+  renderTable();
+});
+
+// ---------------------------------------------------------------------------
+// 可拖动分隔条（左侧宽度 / 底部面板高度）
+// ---------------------------------------------------------------------------
+function initSplitters() {
+  const drag = (handle, onMove) => {
+    handle.addEventListener("mousedown", e => {
+      e.preventDefault();
+      handle.classList.add("active");
+      document.body.classList.add("dragging");
+      const move = ev => onMove(ev);
+      const up = () => {
+        handle.classList.remove("active");
+        document.body.classList.remove("dragging");
+        document.removeEventListener("mousemove", move);
+        document.removeEventListener("mouseup", up);
+        chart && chart.resize();
+      };
+      document.addEventListener("mousemove", move);
+      document.addEventListener("mouseup", up);
+    });
+  };
+  const aside = document.querySelector("aside");
+  drag($("vSplit"), ev => {
+    const w = Math.min(Math.max(ev.clientX, 280), window.innerWidth * 0.7);
+    aside.style.width = w + "px";
+    chart && chart.resize();
+  });
+  const panel = document.querySelector(".signals-panel");
+  drag($("hSplit"), ev => {
+    const h = Math.min(Math.max(window.innerHeight - ev.clientY, 120), window.innerHeight * 0.7);
+    panel.style.height = h + "px";
+    chart && chart.resize();
+  });
+}
+
+window.addEventListener("resize", () => chart && chart.resize());
+initSplitters();
+loadWatch();
+connectWS();
+</script>
+</body>
+</html>

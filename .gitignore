@@ -1,0 +1,19 @@
+# 运行时数据（K线数据库、用户自选/自定义池，运行时自动重建）
+kline.db
+kline.db-wal
+kline.db-shm
+user_pool.json
+*.log
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# 系统与编辑器
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
