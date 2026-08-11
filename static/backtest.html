@@ -1,0 +1,220 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>战法验证台</title>
+<style>
+  :root {
+    --bg:#0d1117; --panel:#161b22; --border:#21262d; --text:#e6edf3; --muted:#8b949e;
+    --accent:#58a6ff; --up:#f85149; --down:#3fb950; --warn:#d29922;
+  }
+  * { box-sizing:border-box; margin:0; padding:0; }
+  body { background:var(--bg); color:var(--text); font:13px/1.6 "Microsoft YaHei",sans-serif; }
+  header {
+    display:flex; align-items:center; gap:12px; padding:10px 16px;
+    background:var(--panel); border-bottom:1px solid var(--border);
+  }
+  header h1 { font-size:16px; }
+  header a { color:var(--accent); font-size:12px; text-decoration:none; }
+  main { display:flex; height:calc(100vh - 48px); }
+  aside {
+    width:300px; min-width:280px; padding:14px; overflow-y:auto;
+    border-right:1px solid var(--border); background:var(--panel);
+  }
+  aside h2 { font-size:13px; color:var(--muted); margin:14px 0 6px; }
+  aside h2:first-child { margin-top:0; }
+  label { display:block; font-size:12px; color:var(--muted); margin:8px 0 4px; }
+  input, select, textarea {
+    width:100%; background:var(--bg); color:var(--text);
+    border:1px solid var(--border); border-radius:6px;
+    padding:6px 8px; font-size:13px; outline:none;
+  }
+  input:focus, select:focus, textarea:focus { border-color:var(--accent); }
+  textarea { resize:vertical; min-height:64px; font-family:Consolas,monospace; }
+  .row { display:flex; gap:8px; }
+  .row > div { flex:1; }
+  button {
+    background:var(--accent); color:#fff; border:none; border-radius:6px;
+    padding:7px 14px; font-size:13px; cursor:pointer; width:100%;
+  }
+  button.secondary {
+    background:transparent; color:var(--accent); border:1px solid var(--accent);
+    padding:4px 8px; font-size:12px;
+  }
+  .btn-row { display:flex; gap:6px; margin-top:6px; }
+  .btn-row button { flex:1; }
+  #runBtn { margin-top:18px; padding:10px; font-size:14px; font-weight:600; }
+  #runBtn:disabled { opacity:.5; cursor:wait; }
+  #statusMsg { margin-top:8px; font-size:12px; color:var(--muted); min-height:18px; }
+  section { flex:1; padding:14px 18px; overflow-y:auto; min-width:0; }
+  .cards { display:grid; grid-template-columns:repeat(auto-fit,minmax(140px,1fr)); gap:10px; margin-bottom:14px; }
+  .card { background:var(--panel); border:1px solid var(--border); border-radius:8px; padding:10px 12px; }
+  .card .label { color:var(--muted); font-size:12px; }
+  .card .value { font-size:18px; font-weight:600; margin-top:2px; }
+  .card .hint { color:var(--muted); font-size:11px; }
+  .pos { color:var(--up); } .neg { color:var(--down); }
+  .panel { background:var(--panel); border:1px solid var(--border); border-radius:8px; padding:12px; margin-bottom:14px; }
+  .panel h2 { font-size:13px; margin-bottom:8px; }
+  .tbl-wrap { max-height:60vh; overflow-y:auto; }
+  table { width:100%; border-collapse:collapse; font-size:12px; }
+  th,td { padding:6px 8px; border-bottom:1px solid var(--border); text-align:right; white-space:nowrap; }
+  th { color:var(--muted); font-weight:normal; position:sticky; top:0; background:var(--panel); }
+  td:first-child, th:first-child, td:nth-child(2), th:nth-child(2) { text-align:left; }
+  .warn { color:var(--warn); }
+  .muted { color:var(--muted); }
+  #empty { text-align:center; color:var(--muted); padding:60px 0; }
+  ::-webkit-scrollbar { width:8px; height:8px; }
+  ::-webkit-scrollbar-thumb { background:#30363d; border-radius:4px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>🧪 战法验证台</h1>
+  <span class="muted">固定金额单笔核算：总盈亏 / 胜利次数 / 买卖时机</span>
+  <span style="flex:1"></span>
+  <a href="/">← 返回实时选股</a>
+</header>
+<main>
+  <aside>
+    <h2>验证配置</h2>
+    <label>战法</label>
+    <select id="strategy"></select>
+    <label>股票代码（逗号分隔，支持代码/名称搜索）</label>
+    <textarea id="codes" placeholder="601882,600519"></textarea>
+    <div class="btn-row">
+      <button class="secondary" onclick="loadScope('pool')">📊 股票池</button>
+      <button class="secondary" onclick="loadScope('watch')">★ 自选</button>
+    </div>
+    <label>K线周期</label>
+    <select id="period">
+      <option value="30m" selected>30分钟</option>
+      <option value="60m">60分钟</option>
+      <option value="15m">15分钟</option>
+      <option value="5m">5分钟</option>
+      <option value="daily">日K</option>
+      <option value="weekly">周K</option>
+    </select>
+    <div class="row">
+      <div><label>开始日期</label><input type="date" id="start" value="2024-01-01"></div>
+      <div><label>结束日期</label><input type="date" id="end"></div>
+    </div>
+    <div class="row">
+      <div><label>每笔金额(元)</label><input type="number" id="amount" value="10000" min="0" step="1000"></div>
+      <div><label>止盈%</label><input type="number" id="takeProfit" value="0" min="0"></div>
+    </div>
+    <div class="row">
+      <div><label>止损%</label><input type="number" id="stopLoss" value="0" min="0"></div>
+      <div><label>持有期(根)</label><input type="number" id="maxHold" value="0" min="0"></div>
+    </div>
+    <button id="runBtn" onclick="run()">▶ 运行验证</button>
+    <div id="statusMsg"></div>
+  </aside>
+  <section>
+    <div class="cards" id="cards"></div>
+    <div class="panel" id="tradesPanel" style="display:none">
+      <h2 id="tradesTitle">交易明细</h2>
+      <div class="tbl-wrap"><table>
+        <thead><tr><th>代码</th><th>名称</th><th>买入时间</th><th>买入价</th><th>卖出时间</th>
+          <th>卖出价</th><th>投入(元)</th><th>盈亏(元)</th><th>盈亏%</th><th>持有(根)</th><th>卖出原因</th></tr></thead>
+        <tbody id="tradesBody"></tbody>
+      </table></div>
+    </div>
+    <div class="panel" id="metaPanel" style="display:none">
+      <h2>验证信息</h2>
+      <div id="metaBody" class="muted"></div>
+    </div>
+    <div id="empty">配置参数后点击「运行验证」开始</div>
+  </section>
+</main>
+<script>
+const $ = id => document.getElementById(id);
+const fmt = (v, d = 2) => v == null ? '-' : Number(v).toLocaleString('zh-CN', { minimumFractionDigits: d, maximumFractionDigits: d });
+const pct = (v, d = 2) => v == null ? '-' : (v > 0 ? '+' : '') + Number(v).toFixed(d) + '%';
+
+// 战法列表
+fetch('/api/backtest/strategies').then(r => r.json()).then(d => {
+  const sel = $('strategy');
+  sel.innerHTML = d.strategies.map(s =>
+    `<option value="${s.key}" title="${s.desc}">${s.name} (${s.key})</option>`).join('');
+});
+
+// 快捷加载股票池/自选
+async function loadScope(kind) {
+  const d = await fetch('/api/' + kind).then(r => r.json());
+  const list = kind === 'pool' ? d.stocks : d.watch;
+  $('codes').value = (list || []).map(x => x.code).join(',');
+  $('statusMsg').textContent = `已载入 ${(list || []).length} 只`;
+}
+
+// 运行验证
+async function run() {
+  const btn = $('runBtn');
+  btn.disabled = true;
+  $('statusMsg').textContent = '正在拉取数据并验证（首次需在线取数，请耐心等待）…';
+  const body = {
+    strategy: $('strategy').value,
+    codes: $('codes').value.split(/[,，\s]+/).filter(Boolean),
+    period: $('period').value,
+    start: $('start').value || '',
+    end: $('end').value || '',
+    amount: parseFloat($('amount').value) || 10000,
+    take_profit_pct: parseFloat($('takeProfit').value) || 0,
+    stop_loss_pct: parseFloat($('stopLoss').value) || 0,
+    max_hold_bars: parseInt($('maxHold').value) || 0,
+  };
+  try {
+    const d = await fetch('/api/backtest/run', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    }).then(r => r.json());
+    render(d);
+  } catch (e) {
+    $('statusMsg').textContent = '运行失败: ' + e.message;
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+function render(d) {
+  $('empty').style.display = 'none';
+  if (!d.ok) {
+    $('statusMsg').textContent = d.msg || '运行失败';
+    $('cards').innerHTML = '';
+    $('tradesPanel').style.display = 'none';
+    $('metaPanel').style.display = 'none';
+    return;
+  }
+  $('statusMsg').textContent = `完成：${d.stocks.length} 只 | 数据 ${d.data_source.cache_hits} 缓存 / ${d.data_source.fetched} 在线拉取`;
+  const m = d.metrics;
+  const cls = v => v >= 0 ? 'pos' : 'neg';
+  $('cards').innerHTML = [
+    { label: '总盈亏(元)', value: fmt(m.total_pnl), cls: cls(m.total_pnl), hint: pct(m.total_return_pct) + ' 相对投入 ' + fmt(m.total_invest, 0) },
+    { label: '胜利次数', value: m.win_count + ' 胜', cls: 'pos', hint: m.loss_count + ' 负 / 共 ' + m.trade_count + ' 笔' },
+    { label: '胜率', value: fmt(m.win_rate_pct) + '%', hint: '' },
+    { label: '盈亏比', value: m.profit_loss_ratio == null ? '-' : fmt(m.profit_loss_ratio), hint: '均盈 ' + fmt(m.avg_win) + ' / 均亏 ' + fmt(m.avg_loss) },
+  ].map(c => `<div class="card"><div class="label">${c.label}</div><div class="value ${c.cls || ''}">${c.value}</div><div class="hint">${c.hint}</div></div>`).join('');
+
+  const tb = $('tradesBody');
+  tb.innerHTML = (d.trades || []).map(t => `<tr>
+    <td>${t.code}</td><td>${t.name}</td><td>${t.buy_ts}</td><td>${fmt(t.buy_price)}</td>
+    <td>${t.sell_ts}</td><td>${fmt(t.sell_price)}</td><td>${fmt(t.amount, 0)}</td>
+    <td class="${cls(t.pnl)}">${fmt(t.pnl)}</td><td class="${cls(t.pnl_pct)}">${pct(t.pnl_pct)}</td>
+    <td>${t.hold_bars}</td><td>${t.sell_reason}</td>
+  </tr>`).join('');
+  $('tradesTitle').textContent = `交易明细（共 ${m.trade_count} 笔）`;
+  $('tradesPanel').style.display = '';
+
+  const warn = (d.warnings || []).map(w => `<div class="warn">⚠ ${w}</div>`).join('');
+  const skip = (d.skipped || []).length ? `<div class="warn">跳过 ${d.skipped.length} 只：${d.skipped.map(s => s.code + '(' + s.reason + ')').join('；')}</div>` : '';
+  $('metaBody').innerHTML =
+    `<div>战法：${d.strategy.name} (${d.strategy.key}) ｜ 周期：${d.config.period} ｜ 每笔：${fmt(d.config.amount, 0)} 元` +
+    ` ｜ 手续费：${(d.config.commission_rate * 100).toFixed(1)}‰ ｜ 滑点：${(d.config.slippage_rate * 100).toFixed(1)}‰</div>` +
+    `<div>区间：${d.config.start || '数据起点'} ~ ${d.config.end || '数据终点'}` +
+    ` ｜ 止盈/止损/持有期：${d.config.take_profit_pct}% / ${d.config.stop_loss_pct}% / ${d.config.max_hold_bars}根</div>` +
+    warn + skip;
+  $('metaPanel').style.display = '';
+}
+</script>
+</body>
+</html>

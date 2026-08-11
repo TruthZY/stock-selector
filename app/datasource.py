@@ -581,19 +581,20 @@ class DataSource:
         """K线获取：东财 → 腾讯 → 新浪 → BaoStock 逐级降级。
         min_len：期望返回根数，某级返回不足时继续降级（末级返回已有数据）
         start_date/end_date：可选精确区间（YYYY-MM-DD），供长历史回测使用"""
-        chain = [
-            EastmoneyKline.fetch_kline(code, period, limit, client=self.client,
-                                       start_date=start_date),
-            TencentKline.fetch_kline(code, period, limit, client=self.client),
-            SinaKline.fetch_kline(code, period, limit, client=self.client),
-            BaoStockKline.fetch_kline(code, period, limit,
-                                      start_date=start_date, end_date=end_date),
+        # 惰性创建协程：逐级尝试，命中即停，避免未执行的协程产生警告
+        fetchers = [
+            lambda: EastmoneyKline.fetch_kline(code, period, limit, client=self.client,
+                                               start_date=start_date),
+            lambda: TencentKline.fetch_kline(code, period, limit, client=self.client),
+            lambda: SinaKline.fetch_kline(code, period, limit, client=self.client),
+            lambda: BaoStockKline.fetch_kline(code, period, limit,
+                                              start_date=start_date, end_date=end_date),
         ]
-        for i, fut in enumerate(chain):
-            data = await fut
-            if data and (len(data) >= min_len or i == len(chain) - 1):
+        for i, make in enumerate(fetchers):
+            data = await make()
+            if data and (len(data) >= min_len or i == len(fetchers) - 1):
                 return data
-            if i == len(chain) - 1:
+            if i == len(fetchers) - 1:
                 return data or []
         return []
 

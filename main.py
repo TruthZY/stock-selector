@@ -91,6 +91,25 @@ async def index():
     return FileResponse(os.path.join(STATIC_DIR, "index.html"))
 
 
+@app.get("/backtest")
+async def backtest_page():
+    """战法验证页面（独立界面：选战法/股票/时间范围）"""
+    return FileResponse(os.path.join(STATIC_DIR, "backtest.html"))
+
+
+@app.get("/api/backtest/strategies")
+async def backtest_strategies():
+    from app.backtest import list_strategies
+    return {"strategies": list_strategies()}
+
+
+@app.post("/api/backtest/run")
+async def backtest_run(req: dict):
+    """运行信号验证：固定金额单笔核算，输出总盈亏/胜率/买卖时机清单"""
+    from app.backtest.validator import run_validator
+    return await run_validator(req)
+
+
 @app.get("/api/status")
 async def status():
     return {
