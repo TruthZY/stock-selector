@@ -11,21 +11,14 @@ from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple
 
 from app.backtest.cache import KlineCache
+from app.backtest.loader import (FETCH_THROTTLE_SECONDS, PERIOD_BARS_PER_DAY,
+                                 PERIOD_FETCH_CAP, load_kline_merged)
 from app.backtest.metrics import compute_metrics
 from app.backtest.position import Position, Trade
 from app.backtest.rules import build_strategy
 from app.backtest.strategy import BarContext, Signal, STRATEGY_REGISTRY
 from app.datasource import DataSource
 from app.store import Store
-
-# 各周期每个交易日的K线根数（用于估算拉取量与预热天数）
-PERIOD_BARS_PER_DAY = {"1m": 240, "5m": 48, "15m": 16, "30m": 8, "60m": 4,
-                       "daily": 1, "weekly": 0.2}
-# 数据源单次拉取根数上限（约两年半：避免长历史拉取触发数据源限速）
-PERIOD_FETCH_CAP = {"1m": 8000, "5m": 8000, "15m": 8000, "30m": 5000, "60m": 2500,
-                    "daily": 700, "weekly": 200}
-# 串行拉取节流间隔（秒）：BaoStock 等源对连续请求限速，逐只拉取并间隔
-FETCH_THROTTLE_SECONDS = 0.5
 
 _ASSUMPTIONS = [
     "K线为前复权数据，忽略分红除权影响",
@@ -94,22 +87,18 @@ class BacktestEngine:
             return self._result(ok=False, msg="标的列表为空，请检查 scope 配置")
         names = dict(stocks)
 
-        # 数据：本地缓存优先（当天有效）；未命中则逐只串行拉取（每次只请求一支股票，
-        # 间隔节流防限速）并落缓存，二次回测直接命中免拉取
+        # 数据：本地缓存优先（长期复用）；缺失区间增量拉取合并，
+        # 逐只串行（每次只请求一支股票）间隔节流防限速
         need = self._estimate_fetch_limit()
         warmup_start = self._warmup_start()
         data: Dict[str, List[dict]] = {}
         cache_hits = 0
         for code in list(names):
-            kl = self.cache.get(code, cfg.period, warmup_start, cfg.end)
-            if kl is not None:
-                data[code] = kl
+            kl, from_cache = await load_kline_merged(
+                self.ds, self.cache, code, cfg.period, need, warmup_start, cfg.end)
+            if from_cache and kl:
                 cache_hits += 1
-                continue
-            kl = await self.ds.kline(code, cfg.period, need, min_len=need,
-                                     start_date=warmup_start, end_date=cfg.end)
             if kl:
-                self.cache.put(code, cfg.period, kl)
                 data[code] = kl
             await asyncio.sleep(FETCH_THROTTLE_SECONDS)
         self.data_source = {"cache_hits": cache_hits, "fetched": len(data) - cache_hits}

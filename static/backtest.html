@@ -155,38 +155,62 @@ fetch('/api/backtest/rules').then(r => r.json()).then(d => {
   renderParams();
 });
 
-// 参数动态渲染：中文标签 + 默认值，可下拉折叠
+// 参数本地缓存（localStorage）：按规则 key 记忆调整过的参数，下次自动恢复
+const LS_PARAM_KEY = 'bt_rule_params_v1';
+function loadSavedParams() {
+  try { return JSON.parse(localStorage.getItem(LS_PARAM_KEY)) || {}; }
+  catch (e) { return {}; }
+}
+function savedRuleParams(ruleType, ruleKey) {
+  return (loadSavedParams()[ruleType] || {})[ruleKey] || null;
+}
+function saveRuleParams(ruleType, ruleKey, params) {
+  const all = loadSavedParams();
+  all[ruleType] = all[ruleType] || {};
+  all[ruleType][ruleKey] = params;
+  localStorage.setItem(LS_PARAM_KEY, JSON.stringify(all));
+}
+function collectBoxParams(boxId) {
+  const out = {};
+  document.querySelectorAll('#' + boxId + ' input[data-pkey]').forEach(inp => {
+    const k = inp.dataset.pkey;
+    const raw = inp.value.trim();
+    if (raw === '') return;
+    out[k] = /^[-+]?\d+(\.\d+)?$/.test(raw) ? parseFloat(raw) : raw;
+  });
+  return out;
+}
+
+// 参数动态渲染：中文标签 + 默认值，可下拉折叠；调整后自动缓存到本地
 function renderParams() {
-  const render = (boxId, ruleKey, list, title) => {
+  const render = (boxId, ruleKey, list, title, boxType) => {
     const r = list.find(x => x.key === $(ruleKey).value) || {};
     const p = r.default_params || {};
     const labels = r.param_labels || {};
+    const saved = savedRuleParams(boxType, $(ruleKey).value) || {};
     const keys = Object.keys(p);
     $(boxId).innerHTML =
       `<details ${keys.length ? 'open' : ''}><summary>${title}（${keys.length} 项）</summary>` +
       (keys.length ? keys.map(k => {
-        const v = p[k];
+        const v = saved[k] !== undefined ? saved[k] : p[k];
         const type = typeof v === 'number' ? 'number' : 'text';
         return `<div class="row"><div><label title="${k}">${labels[k] || k}</label>` +
           `<input type="${type}" data-pkey="${k}" value="${v}" ${type === 'number' ? 'step="any"' : ''}></div></div>`;
       }).join('') : '<div class="muted" style="font-size:11px">无参数</div>') +
       '</details>';
+    // 参数调整即缓存（change 事件，输入完成失焦触发）
+    document.querySelectorAll('#' + boxId + ' input[data-pkey]').forEach(inp => {
+      inp.addEventListener('change', () => {
+        saveRuleParams(boxType, $(ruleKey).value, collectBoxParams(boxId));
+      });
+    });
   };
-  render('buyParamBox', 'buyRule', RULES.buy_rules, '买入参数');
-  render('sellParamBox', 'sellRule', RULES.sell_rules, '卖出参数');
+  render('buyParamBox', 'buyRule', RULES.buy_rules, '买入参数', 'buy');
+  render('sellParamBox', 'sellRule', RULES.sell_rules, '卖出参数', 'sell');
 }
 
 function collectParams() {
-  const out = {};
-  ['buyParamBox', 'sellParamBox'].forEach(box => {
-    document.querySelectorAll('#' + box + ' input[data-pkey]').forEach(inp => {
-      const k = inp.dataset.pkey;
-      const raw = inp.value.trim();
-      if (raw === '') return;
-      out[k] = /^[-+]?\d+(\.\d+)?$/.test(raw) ? parseFloat(raw) : raw;
-    });
-  });
-  return out;
+  return { ...collectBoxParams('buyParamBox'), ...collectBoxParams('sellParamBox') };
 }
 
 // 快捷加载股票池/自选

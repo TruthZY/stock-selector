@@ -256,22 +256,46 @@ class BaoStockKline:
     """BaoStock 历史K线：分钟K/日K/周K，前复权，区间查询
     同步 socket 库，通过 asyncio.to_thread 包装；懒登录 + 线程锁保护
     注意：baostock 底层为单连接，查询必须串行（_query_lock），并发请求排队执行
-    分钟K volume 单位为股，换算为手（/100）与现有数据一致"""
+    分钟K volume 单位为股，换算为手（/100）与现有数据一致
+
+    防挂起策略：锁获取超时 + 查询超时熔断（单次挂起即冷却 5 分钟），
+    避免服务器风控时每个请求无限等待/反复重试拖垮整体"""
 
     _lock = threading.Lock()       # 登录锁
     _query_lock = threading.Lock() # 查询锁（单连接串行化）
     _ready = False
+    # 熔断状态：查询/等锁超时视为服务器风控挂起，冷却期内直接跳过 BaoStock
+    _cooldown_until = 0.0
+    _cooldown_lock = threading.Lock()
+    _LOCK_TIMEOUT = 25.0           # 等锁超时（秒）
+    _QUERY_TIMEOUT = 20.0          # 单次查询超时（秒）
+    _COOLDOWN_SECONDS = 300.0      # 熔断冷却（秒）
+
+    @staticmethod
+    def _available() -> bool:
+        with BaoStockKline._cooldown_lock:
+            return time.time() >= BaoStockKline._cooldown_until
+
+    @staticmethod
+    def _record_hang() -> None:
+        """标记挂起：冷却期内不再尝试 BaoStock（风控信号）"""
+        with BaoStockKline._cooldown_lock:
+            BaoStockKline._cooldown_until = time.time() + BaoStockKline._COOLDOWN_SECONDS
 
     @staticmethod
     def _ensure_login():
         import baostock as bs
-        with BaoStockKline._lock:
+        if not BaoStockKline._lock.acquire(timeout=BaoStockKline._LOCK_TIMEOUT):
+            raise RuntimeError("BaoStock 登录锁超时（疑似连接挂起）")
+        try:
             if BaoStockKline._ready:
                 return
             lg = bs.login()
             if lg.error_code != "0":
                 raise RuntimeError(f"BaoStock 登录失败: {lg.error_msg}")
             BaoStockKline._ready = True
+        finally:
+            BaoStockKline._lock.release()
 
     @staticmethod
     def _symbol(code: str) -> str:
@@ -298,49 +322,60 @@ class BaoStockKline:
             start_date = (datetime.now() - timedelta(days=int(limit / bpd) + 10)).strftime("%Y-%m-%d")
         end = end_date or "2099-12-31"
         import baostock as bs
+        # 等锁超时：锁被卡死线程占用视为风控挂起，放弃并触发熔断
+        if not BaoStockKline._query_lock.acquire(timeout=BaoStockKline._LOCK_TIMEOUT):
+            BaoStockKline._record_hang()
+            return []
         try:
-            # baostock 单连接：查询与遍历必须持有全局锁，否则并发响应错乱；
-            # 查询后加短间隔节流，避免连续请求触发服务器风控挂起
-            with BaoStockKline._query_lock:
+            try:
+                # baostock 单连接：查询与遍历必须持有全局锁，否则并发响应错乱
+                rs = bs.query_history_k_data_plus(
+                    BaoStockKline._symbol(code), fields, start_date=start_date,
+                    end_date=end, frequency=freq, adjustflag="2")
+            except Exception:
+                return []
+            out: List[dict] = []
+            while rs.error_code == "0" and rs.next():
+                row = rs.get_row_data()
                 try:
-                    rs = bs.query_history_k_data_plus(
-                        BaoStockKline._symbol(code), fields, start_date=start_date,
-                        end_date=end, frequency=freq, adjustflag="2")
-                except Exception:
-                    return []
-                out: List[dict] = []
-                while rs.error_code == "0" and rs.next():
-                    row = rs.get_row_data()
-                    try:
-                        if period.endswith("m"):
-                            # time 形如 20240102100000000，取 HH:MM
-                            ts = f"{row[0]} {row[1][8:10]}:{row[1][10:12]}"
-                            o, c, h, l = float(row[2]), float(row[5]), float(row[4]), float(row[3])
-                            volume = float(row[6]) / 100.0      # 股 -> 手
-                            amount = float(row[7])
-                        else:
-                            ts = row[0]
-                            o, c, h, l = float(row[1]), float(row[4]), float(row[3]), float(row[2])
-                            volume = float(row[5]) / 100.0
-                            amount = float(row[6])
-                        out.append({"ts": ts, "open": o, "close": c,
-                                    "high": h, "low": l, "volume": volume, "amount": amount})
-                    except (ValueError, IndexError):
-                        continue
-                time.sleep(0.5)   # 节流：降低连续查询触发限流的概率
+                    if period.endswith("m"):
+                        # time 形如 20240102100000000，取 HH:MM
+                        ts = f"{row[0]} {row[1][8:10]}:{row[1][10:12]}"
+                        o, c, h, l = float(row[2]), float(row[5]), float(row[4]), float(row[3])
+                        volume = float(row[6]) / 100.0      # 股 -> 手
+                        amount = float(row[7])
+                    else:
+                        ts = row[0]
+                        o, c, h, l = float(row[1]), float(row[4]), float(row[3]), float(row[2])
+                        volume = float(row[5]) / 100.0
+                        amount = float(row[6])
+                    out.append({"ts": ts, "open": o, "close": c,
+                                "high": h, "low": l, "volume": volume, "amount": amount})
+                except (ValueError, IndexError):
+                    continue
+            time.sleep(0.5)   # 节流（持锁期间）：降低连续查询触发限流的概率
+            return out
         except Exception:
             return []
-        return out
+        finally:
+            BaoStockKline._query_lock.release()
 
     @staticmethod
     async def fetch_kline(code: str, period: str = "daily", limit: int = 300,
                           start_date: str = "", end_date: str = "") -> List[dict]:
-        """异步拉取（同步库在线程池执行，20s 超时防单只查询挂起拖垮整体）"""
+        """异步拉取（同步库在线程池执行，超时防单只查询挂起拖垮整体）
+        冷却期内直接跳过；单次超时即触发熔断冷却"""
+        if not BaoStockKline._available():
+            return []
         try:
-            return await asyncio.wait_for(
+            data = await asyncio.wait_for(
                 asyncio.to_thread(
                     BaoStockKline._fetch_sync, code, period, limit, start_date, end_date),
-                timeout=20.0)
+                timeout=BaoStockKline._QUERY_TIMEOUT)
+            return data
+        except asyncio.TimeoutError:
+            BaoStockKline._record_hang()   # 查询挂起 = 风控信号，冷却期内不再尝试
+            return []
         except Exception:
             return []
 

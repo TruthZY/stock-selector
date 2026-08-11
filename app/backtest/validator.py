@@ -15,6 +15,7 @@ from typing import Dict, List, Optional, Tuple
 from app.backtest.cache import KlineCache
 from app.backtest.engine import (FETCH_THROTTLE_SECONDS, PERIOD_BARS_PER_DAY,
                                  PERIOD_FETCH_CAP)
+from app.backtest.loader import load_kline_merged
 from app.backtest.rules import build_strategy
 from app.backtest.strategy import BarContext, Signal
 from app.datasource import DataSource
@@ -97,21 +98,17 @@ class Validator:
             return self._result(ok=False, msg="标的列表为空，请检查 scope 配置")
         names = dict(stocks)
 
-        # 数据：缓存优先 + 逐只串行拉取（防数据源限速）
+        # 数据：缓存优先（长期复用）+ 缺失区间增量拉取合并；逐只串行防限速
         need = self._estimate_limit()
         warmup_start = self._warmup_start()
         data: Dict[str, List[dict]] = {}
         cache_hits = 0
         for code in list(names):
-            kl = self.cache.get(code, cfg.period, warmup_start, cfg.end)
-            if kl is not None:
-                data[code] = kl
+            kl, from_cache = await load_kline_merged(
+                self.ds, self.cache, code, cfg.period, need, warmup_start, cfg.end)
+            if from_cache and kl:
                 cache_hits += 1
-                continue
-            kl = await self.ds.kline(code, cfg.period, need, min_len=need,
-                                     start_date=warmup_start, end_date=cfg.end)
             if kl:
-                self.cache.put(code, cfg.period, kl)
                 data[code] = kl
             await asyncio.sleep(FETCH_THROTTLE_SECONDS)
         bars_map, skipped = self._prepare_data(data, names)

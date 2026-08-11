@@ -62,24 +62,29 @@ class KlineCache:
 
     # ------------------------- 读取 -------------------------
 
-    def get(self, code: str, period: str,
-            start_ts: str = "", end_ts: str = "") -> Optional[List[dict]]:
-        """取当天拉取的缓存K线（升序）；start_ts/end_ts 非空时要求覆盖该区间，
-        缓存缺失/过期/覆盖不足均返回 None（触发重新拉取）"""
-        today = time.strftime("%Y-%m-%d")
+    def get_all(self, code: str, period: str) -> Optional[List[dict]]:
+        """取该股该周期的全部缓存K线（升序，跨拉取日长期复用）；无缓存返回 None"""
         with self._lock:
             conn = self._connect()
             try:
                 rows = conn.execute(
                     "SELECT ts,open,high,low,close,volume,amount FROM kline_cache "
-                    "WHERE code=? AND period=? AND fetched_at=? ORDER BY ts",
-                    (code, period, today)).fetchall()
+                    "WHERE code=? AND period=? ORDER BY ts",
+                    (code, period)).fetchall()
             finally:
                 conn.close()
         if not rows:
             return None
-        kl = [{"ts": r[0], "open": r[1], "high": r[2], "low": r[3],
-               "close": r[4], "volume": r[5], "amount": r[6]} for r in rows]
+        return [{"ts": r[0], "open": r[1], "high": r[2], "low": r[3],
+                 "close": r[4], "volume": r[5], "amount": r[6]} for r in rows]
+
+    def get(self, code: str, period: str,
+            start_ts: str = "", end_ts: str = "") -> Optional[List[dict]]:
+        """取缓存K线；start_ts/end_ts 非空时要求覆盖该区间，
+        缓存缺失/覆盖不足返回 None（调用方按增量逻辑补拉）"""
+        kl = self.get_all(code, period)
+        if not kl:
+            return None
         # 覆盖检查带 7 天容差：请求起点/终点是自然日，数据从相邻交易日开始，
         # 避免节假日/周末错位导致误判覆盖不足而重复拉取
         if start_ts and self._day_gap(kl[0]["ts"], start_ts) > 7:
