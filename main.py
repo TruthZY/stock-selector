@@ -103,6 +103,13 @@ async def backtest_strategies():
     return {"strategies": list_strategies()}
 
 
+@app.get("/api/backtest/rules")
+async def backtest_rules():
+    """买入/卖出规则列表（含默认参数与参数中文名），供验证台拆分选择"""
+    from app.backtest.rules import list_rules
+    return list_rules()
+
+
 @app.post("/api/backtest/run")
 async def backtest_run(req: dict):
     """运行信号验证：固定金额单笔核算，输出总盈亏/胜率/买卖时机清单"""

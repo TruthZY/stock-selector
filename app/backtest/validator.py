@@ -15,8 +15,8 @@ from typing import Dict, List, Optional, Tuple
 from app.backtest.cache import KlineCache
 from app.backtest.engine import (FETCH_THROTTLE_SECONDS, PERIOD_BARS_PER_DAY,
                                  PERIOD_FETCH_CAP)
-from app.backtest.strategy import (STRATEGY_REGISTRY, BarContext, Signal,
-                                   get_strategy)
+from app.backtest.rules import build_strategy
+from app.backtest.strategy import BarContext, Signal
 from app.datasource import DataSource
 from app.store import Store
 
@@ -42,6 +42,8 @@ class ValidatorConfig:
     commission_rate: float = 0.001
     slippage_rate: float = 0.002
     strategy: str = "kdj_rsi_golden"
+    buy_rule: str = ""                    # 买入规则 key（组合模式）
+    sell_rule: str = ""                   # 卖出规则 key（组合模式）
     params: Dict = field(default_factory=dict)
     take_profit_pct: float = 0.0            # 止盈 %，0=关闭
     stop_loss_pct: float = 0.0              # 止损 %，0=关闭
@@ -71,15 +73,19 @@ class VPosition:
 class Validator:
     """信号验证器：固定金额单笔核算"""
 
+    # 买入质量判定：持仓期间曾达到该涨幅（%）视为"曾经盈利"
+    QUALITY_GAIN_PCT = 2.0
+
     def __init__(self, cfg: ValidatorConfig):
         self.cfg = cfg
         self.ds = DataSource()
         self.store = Store()
         self.cache = KlineCache()
         self.warnings: List[str] = []
-        self.positions: Dict[str, VPosition] = {}   # code -> 持仓
+        self.positions: Dict[str, List[VPosition]] = {}   # code -> 持仓列表（多笔独立）
         self.trades: List[dict] = []
-        self.pending: Dict[str, Signal] = {}   # T+1/next_open 延迟信号
+        self.pending_buy: Dict[str, Signal] = {}           # next_open 买入延迟
+        self.pending_sells: Dict[str, Dict[str, Signal]] = {}  # code -> {buy_ts: T+1顺延卖出}
         self.strategies: Dict[str, object] = {}
 
     # ------------------------- 主流程 -------------------------
@@ -112,6 +118,7 @@ class Validator:
         if not bars_map:
             return self._result(ok=False, msg="无可用K线数据（数据源不可用或数据不足）",
                                 skipped=skipped)
+        self.bars_map = bars_map
         codes_ok = list(bars_map)
 
         timeline = sorted({k["ts"] for code in codes_ok
@@ -134,66 +141,67 @@ class Validator:
 
         # 每只股票独立策略实例
         for code in codes_ok:
-            st = get_strategy(cfg.strategy)
-            st.params = {**st.default_params, **cfg.params}
-            st.reset()
+            st = build_strategy(cfg)
             st.prepare(bars_map[code])
             self.strategies[code] = st
 
-        # 事件循环：逐时间点推进，单笔独立核算
+        # 事件循环：逐时间点推进；多笔独立持仓，每根K线内先逐笔评估卖出、再评估买入
         for ts in timeline:
             for code in codes_ok:
                 idx = ts_index[code].get(ts)
                 if idx is None:
                     continue
                 bar = bars_map[code][idx]
-
-                # 0. 延迟信号（next_open / T+1 顺延）
-                sig = self.pending.pop(code, None)
-                if sig is not None:
-                    if sig.action == "buy" and code not in self.positions:
-                        self._open(code, names[code], bar, sig, idx, price=bar["open"])
-                    elif sig.action == "sell" and code in self.positions:
-                        pos = self.positions[code]
-                        if bar["ts"][:10] > pos.buy_ts[:10]:
-                            if sig.price is not None:
-                                base = min(sig.price, bar["open"])
-                                sig = Signal(sig.action, sig.reason, sig.fraction,
-                                             sig.amount, base)
-                            self._close(code, names[code], bar, pos, sig, idx)
-                        else:
-                            self.pending[code] = sig
-
-                pos = self.positions.get(code)
-                # 1. 风控（止盈/止损/持有期）
-                risk = self._check_risk(bar, idx, pos)
-                if risk is not None:
-                    self._close(code, names[code], bar, pos, risk, idx)
-                    continue
-
-                # 2. 策略信号
                 st = self.strategies[code]
-                ctx = BarContext(code, names[code], bars_map[code], idx, pos, st.params)
-                sig = st.on_bar(ctx)
-                if sig is None or sig.action not in ("buy", "sell"):
-                    continue
-                if sig.action == "buy":
-                    if pos is None:
-                        if cfg.exec_price == "next_open":
-                            self.pending[code] = sig
-                        else:
-                            self._open(code, names[code], bar, sig, idx)
-                elif sig.action == "sell" and pos is not None:
-                    if cfg.exec_price == "next_open" or bar["ts"][:10] <= pos.buy_ts[:10]:
-                        self.pending[code] = sig
+                day = bar["ts"][:10]
+
+                # 0. 延迟买入（next_open）：每根K线最多一笔
+                sig = self.pending_buy.pop(code, None)
+                if sig is not None and sig.action == "buy":
+                    self._open(code, names[code], bar, sig, idx, price=bar["open"])
+
+                # 1. 逐笔持仓：T+1 顺延卖出 -> 风控 -> 策略卖出信号
+                for pos in list(self.positions.get(code, [])):
+                    pend = self.pending_sells.get(code, {}).get(pos.buy_ts)
+                    if pend is not None:
+                        if day > pos.buy_ts[:10]:   # T+1 已过，执行（跳空优化）
+                            if pend.price is not None:
+                                pend = Signal(pend.action, pend.reason, pend.fraction,
+                                              pend.amount, min(pend.price, bar["open"]))
+                            del self.pending_sells[code][pos.buy_ts]
+                            self._close(code, names[code], bar, pos, pend, idx)
+                        continue
+                    risk = self._check_risk(bar, idx, pos)
+                    if risk is not None:
+                        self._close(code, names[code], bar, pos, risk, idx)
+                        continue
+                    ctx = BarContext(code, names[code], bars_map[code], idx, pos, st.params)
+                    sig = st.on_bar(ctx)
+                    if sig is None or sig.action != "sell":
+                        continue
+                    if cfg.exec_price == "next_open" or day <= pos.buy_ts[:10]:
+                        self.pending_sells.setdefault(code, {})[pos.buy_ts] = sig
                     else:
                         self._close(code, names[code], bar, pos, sig, idx)
 
-        # 收尾：期末强制平仓
-        for code, pos in list(self.positions.items()):
+                # 2. 买入评估：有持仓也可买入（每笔独立），每根K线最多一笔
+                ctx = BarContext(code, names[code], bars_map[code], idx, None, st.params)
+                sig = st.on_bar(ctx)
+                if sig is not None and sig.action == "buy":
+                    if cfg.exec_price == "next_open":
+                        self.pending_buy[code] = sig
+                    else:
+                        self._open(code, names[code], bar, sig, idx)
+
+        # 收尾：期末强制平仓（全部持仓）
+        for code, pos_list in list(self.positions.items()):
             last_bar = bars_map[code][-1]
             sig = Signal("sell", reason="期末强制平仓", price=last_bar["close"])
-            self._close(code, names[code], last_bar, pos, sig, len(bars_map[code]) - 1)
+            for pos in list(pos_list):
+                self._close(code, names[code], last_bar, pos, sig, len(bars_map[code]) - 1)
+
+        # 买入质量指标（需回溯持仓区间K线，在全部交易落定后计算）
+        self.quality_metrics = self._compute_buy_quality()
 
         return self._result(ok=True, stocks=stocks, skipped=skipped,
                             cache_hits=cache_hits, fetched=len(data) - cache_hits)
@@ -291,10 +299,15 @@ class Validator:
         amount = sig.amount if sig.amount and sig.amount > 0 else cfg.amount
         if amount <= 0:
             return
-        self.positions[code] = VPosition(
+        self.positions.setdefault(code, []).append(VPosition(
             code=code, name=name, buy_ts=bar["ts"], buy_price=exec_price,
             amount=amount, commission=amount * cfg.commission_rate,
-            entry_bar_index=idx, buy_reason=sig.reason)
+            entry_bar_index=idx, buy_reason=sig.reason))
+        pos = self.positions[code][-1]
+        st = self.strategies.get(code)
+        if st is not None:
+            st.on_position_opened(BarContext(code, name, self.bars_map.get(code) or [],
+                                             idx, pos, st.params), pos)
 
     def _close(self, code: str, name: str, bar: dict, pos: VPosition, sig: Signal,
                idx: int) -> None:
@@ -316,7 +329,58 @@ class Validator:
             "hold_bars": idx - pos.entry_bar_index,
             "buy_reason": pos.buy_reason, "sell_reason": sig.reason,
         })
-        del self.positions[code]
+        pos_list = self.positions.get(code) or []
+        if pos in pos_list:
+            pos_list.remove(pos)
+        st = self.strategies.get(code)
+        if st is not None:
+            st.on_position_closed(BarContext(code, name, self.bars_map.get(code) or [],
+                                             idx, None, st.params), pos)
+
+    # ------------------------- 买入质量 -------------------------
+
+    def _compute_buy_quality(self) -> dict:
+        """买入质量指标（回溯持仓区间K线）：
+        1. 次日盈利率：买入后下一交易日收盘价 > 买入实际价（含滑点）的比例
+        2. 期间浮盈率：买入次日（不含买入当天）起至卖出前最高价达到 +2% 的比例
+        两者显著高于胜率 => 卖出时机偏早（买对了但卖早了）"""
+        next_win = next_total = 0
+        gain2_win = 0
+        for t in self.trades:
+            bars = self.bars_map.get(t["code"]) or []
+            if not bars:
+                continue
+            idx_by_ts = {k["ts"]: i for i, k in enumerate(bars)}
+            bi = idx_by_ts.get(t["buy_ts"])
+            si = idx_by_ts.get(t["sell_ts"])
+            if bi is None:
+                continue
+            bp = t["buy_price"]
+            # 1. 次日盈利：买入后第一个不同交易日的收盘价
+            nxt = next((k for k in bars[bi + 1:]
+                        if k["ts"][:10] != t["buy_ts"][:10]), None)
+            if nxt is not None:
+                next_total += 1
+                if nxt["close"] > bp:
+                    next_win += 1
+            # 2. 期间曾达 +2% 浮盈：买入次日（不含买入当天）至卖出根（含）的最高价
+            if si is not None and si > bi:
+                start = bi + 1
+                while start <= si and bars[start]["ts"][:10] == t["buy_ts"][:10]:
+                    start += 1
+                seg = bars[start:si + 1]
+                if seg and any(k["high"] >= bp * (1 + self.QUALITY_GAIN_PCT / 100.0)
+                               for k in seg):
+                    gain2_win += 1
+        return {
+            "next_day_win_count": next_win,
+            "next_day_total": next_total,
+            "next_day_win_rate_pct": (round(next_win / next_total * 100.0, 2)
+                                       if next_total else None),
+            "max_gain2_count": gain2_win,
+            "max_gain2_rate_pct": (round(gain2_win / len(self.trades) * 100.0, 2)
+                                    if self.trades else None),
+        }
 
     # ------------------------- 结果 -------------------------
 
@@ -324,7 +388,9 @@ class Validator:
                 skipped: Optional[list] = None, cache_hits: int = 0,
                 fetched: int = 0) -> dict:
         cfg = self.cfg
-        meta = STRATEGY_REGISTRY.get(cfg.strategy)
+        st = next(iter(self.strategies.values()), None)
+        st_name = getattr(st, "name", "") if st else ""
+        st_desc = getattr(st, "desc", "") if st else ""
         trades = self.trades
         wins = [t for t in trades if t["pnl"] > 0]
         losses = [t for t in trades if t["pnl"] <= 0]
@@ -333,25 +399,36 @@ class Validator:
         avg_win = sum(t["pnl"] for t in wins) / len(wins) if wins else 0.0
         avg_loss = abs(sum(t["pnl"] for t in losses) / len(losses)) if losses else 0.0
         pl_ratio = avg_win / avg_loss if avg_loss > 0 else (float("inf") if wins else 0.0)
+        # 买入频率：平均每多少自然日出现一次买入（按不同买入交易日）
+        buy_dates = sorted({t["buy_ts"][:10] for t in trades})
+        if len(buy_dates) >= 2:
+            span = (datetime.strptime(buy_dates[-1], "%Y-%m-%d")
+                    - datetime.strptime(buy_dates[0], "%Y-%m-%d")).days
+            avg_buy_interval = span / (len(buy_dates) - 1)
+        else:
+            avg_buy_interval = 0.0
         metrics = {
             "trade_count": len(trades),
             "win_count": len(wins),
             "loss_count": len(losses),
             "win_rate_pct": round(len(wins) / len(trades) * 100.0, 2) if trades else 0.0,
+            "buy_days": len(buy_dates),                        # 涉及买入的交易日数
+            "avg_buy_interval_days": round(avg_buy_interval, 1),  # 平均每 N 天交易一次
             "total_pnl": round(total_pnl, 2),
             "total_invest": round(total_invest, 2),
             "total_return_pct": round(total_pnl / total_invest * 100.0, 2) if total_invest else 0.0,
             "avg_win": round(avg_win, 2),
             "avg_loss": round(avg_loss, 2),
             "profit_loss_ratio": round(pl_ratio, 2) if pl_ratio != float("inf") else None,
+            **getattr(self, "quality_metrics", {}),
         }
         return {
             "ok": ok,
             "msg": msg,
             "config": asdict(cfg),
             "strategy": {"key": cfg.strategy,
-                         "name": meta.name if meta else cfg.strategy,
-                         "desc": meta.desc if meta else ""},
+                         "name": st_name or cfg.strategy,
+                         "desc": st_desc or ""},
             "stocks": [{"code": c, "name": n} for c, n in (stocks or [])],
             "skipped": skipped or [],
             "warnings": self.warnings,

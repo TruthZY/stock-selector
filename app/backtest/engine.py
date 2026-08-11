@@ -13,7 +13,8 @@ from typing import Dict, List, Optional, Tuple
 from app.backtest.cache import KlineCache
 from app.backtest.metrics import compute_metrics
 from app.backtest.position import Position, Trade
-from app.backtest.strategy import BarContext, Signal, STRATEGY_REGISTRY, get_strategy
+from app.backtest.rules import build_strategy
+from app.backtest.strategy import BarContext, Signal, STRATEGY_REGISTRY
 from app.datasource import DataSource
 from app.store import Store
 
@@ -48,7 +49,9 @@ class BacktestConfig:
     init_cash: float = 1_000_000.0         # 初始资金
     commission_rate: float = 0.001         # 手续费（买卖双向）
     slippage_rate: float = 0.002           # 滑点（买价上浮/卖价下浮）
-    strategy: str = "all_in_all_out"       # 战法 key
+    strategy: str = "all_in_all_out"       # 整包战法 key（buy_rule/sell_rule 为空时生效）
+    buy_rule: str = ""                    # 买入规则 key（组合模式）
+    sell_rule: str = ""                   # 卖出规则 key（组合模式）
     params: Dict = field(default_factory=dict)     # 战法参数覆盖
     take_profit_pct: float = 0.0           # 止盈 %，0=关闭
     stop_loss_pct: float = 0.0             # 止损 %，0=关闭
@@ -142,9 +145,7 @@ class BacktestEngine:
 
         # 每只股票独立的策略实例（状态隔离）：reset + prepare 预计算指标
         for code in codes_ok:
-            st = get_strategy(cfg.strategy)
-            st.params = {**st.default_params, **cfg.params}
-            st.reset()
+            st = build_strategy(cfg)
             st.prepare(bars_map[code])
             self.strategies[code] = st
 
@@ -364,13 +365,17 @@ class BacktestEngine:
     def _result(self, ok: bool, msg: str = "", stocks: Optional[list] = None,
                 skipped: Optional[list] = None, metrics: Optional[dict] = None) -> dict:
         meta = STRATEGY_REGISTRY.get(self.cfg.strategy)
+        # 组合模式：优先取策略实例名称（买入规则+卖出规则）
+        st = next(iter(self.strategies.values()), None)
+        st_name = getattr(st, "name", "") if st else ""
+        st_desc = getattr(st, "desc", "") if st else ""
         return {
             "ok": ok,
             "msg": msg,
             "config": asdict(self.cfg),
             "strategy": {"key": self.cfg.strategy,
-                         "name": meta.name if meta else "",
-                         "desc": meta.desc if meta else ""},
+                         "name": st_name or (meta.name if meta else ""),
+                         "desc": st_desc or (meta.desc if meta else "")},
             "stocks": [{"code": c, "name": n} for c, n in (stocks or [])],
             "skipped": skipped or [],
             "warnings": self.warnings,

@@ -72,7 +72,9 @@ def main():
     parser = argparse.ArgumentParser(
         description="回测系统 CLI（参数缺省取 config.BACKTEST_DEFAULT）")
     parser.add_argument("--list-strategies", action="store_true", help="列出已注册战法")
-    parser.add_argument("--strategy", help="战法 key")
+    parser.add_argument("--strategy", help="整包战法 key（--buy-rule/--sell-rule 未指定时生效）")
+    parser.add_argument("--buy-rule", help="买入规则 key（组合模式，如 kdj_rsi_golden/macd_golden/kdj_golden）")
+    parser.add_argument("--sell-rule", help="卖出规则 key（组合模式，如 trailing_death_cross/death_cross/macd_death）")
     parser.add_argument("--scope", choices=["pool", "watch", "codes"], help="标的范围")
     parser.add_argument("--codes", help="scope=codes 时的代码列表，逗号分隔，如 600519,000858")
     parser.add_argument("--start", help="回测起点 YYYY-MM-DD")
@@ -92,11 +94,19 @@ def main():
     args = parser.parse_args()
 
     if args.list_strategies:
-        print("已注册战法：")
+        from app.backtest.rules import list_rules
+        print("已注册整包战法：")
         for s in list_strategies():
             print(f"  [{s['key']}] {s['name']} - {s['desc']}")
             if s["default_params"]:
                 print(f"      默认参数: {s['default_params']}")
+        rules = list_rules()
+        print("\n买入规则（可与卖出规则自由组合）：")
+        for r in rules["buy_rules"]:
+            print(f"  [{r['key']}] {r['name']} - {r['desc']}")
+        print("\n卖出规则：")
+        for r in rules["sell_rules"]:
+            print(f"  [{r['key']}] {r['name']} - {r['desc']}")
         return
 
     # 配置合并：config.BACKTEST_DEFAULT <- CLI 参数覆盖
@@ -115,6 +125,10 @@ def main():
         d["codes"] = [c.strip() for c in args.codes.split(",") if c.strip()]
     if args.strategy_param:
         d["params"] = _parse_params(args.strategy_param)
+    if args.buy_rule and args.sell_rule:
+        d["buy_rule"] = args.buy_rule
+        d["sell_rule"] = args.sell_rule
+        d["strategy"] = "combo"
     cfg = BacktestConfig.from_dict(d)
 
     result = asyncio.run(run_backtest(cfg))

@@ -98,6 +98,16 @@ class BaseStrategy(ABC):
 # ---------------------------------------------------------------------------
 
 STRATEGY_REGISTRY: Dict[str, Type[BaseStrategy]] = {}
+_registered = False
+
+
+def _ensure_registered() -> None:
+    """惰性导入内置战法完成注册：避免 strategy->strategies->rules->strategy 循环导入
+    （首次查询战法时触发，此时 rules 等依赖模块已完整加载）"""
+    global _registered
+    if not _registered:
+        _registered = True
+        from app.backtest import strategies  # noqa: E402,F401
 
 
 def register(key: str):
@@ -111,6 +121,7 @@ def register(key: str):
 
 def get_strategy(key: str) -> BaseStrategy:
     """按 key 实例化战法，未知战法抛 KeyError"""
+    _ensure_registered()
     if key not in STRATEGY_REGISTRY:
         raise KeyError(f"未知战法: {key}，可用: {', '.join(STRATEGY_REGISTRY) or '无'}")
     return STRATEGY_REGISTRY[key]()
@@ -118,10 +129,10 @@ def get_strategy(key: str) -> BaseStrategy:
 
 def list_strategies() -> List[dict]:
     """列出全部已注册战法（key/name/desc/默认参数）"""
+    _ensure_registered()
     return [{"key": cls.key, "name": cls.name, "desc": cls.desc,
              "default_params": dict(cls.default_params or {})}
             for cls in STRATEGY_REGISTRY.values()]
 
 
-# 导入内置战法以完成注册（放在注册函数之后避免循环依赖）
-from app.backtest import strategies  # noqa: E402,F401
+# 注册函数本身不触发内置战法导入（避免循环依赖）

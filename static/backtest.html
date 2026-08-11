@@ -61,8 +61,14 @@
   th,td { padding:6px 8px; border-bottom:1px solid var(--border); text-align:right; white-space:nowrap; }
   th { color:var(--muted); font-weight:normal; position:sticky; top:0; background:var(--panel); }
   td:first-child, th:first-child, td:nth-child(2), th:nth-child(2) { text-align:left; }
-  .warn { color:var(--warn); }
-  .muted { color:var(--muted); }
+  .warn { color: var(--warn); }
+  .muted { color: var(--muted); }
+  details { margin-bottom: 4px; }
+  details summary {
+    cursor: pointer; font-size: 12px; color: var(--muted);
+    padding: 4px 2px; user-select: none;
+  }
+  details summary:hover { color: var(--text); }
   #empty { text-align:center; color:var(--muted); padding:60px 0; }
   ::-webkit-scrollbar { width:8px; height:8px; }
   ::-webkit-scrollbar-thumb { background:#30363d; border-radius:4px; }
@@ -78,8 +84,12 @@
 <main>
   <aside>
     <h2>验证配置</h2>
-    <label>战法</label>
-    <select id="strategy"></select>
+    <label>买入战法</label>
+    <select id="buyRule" onchange="renderParams()"></select>
+    <div id="buyParamBox"></div>
+    <label>卖出战法</label>
+    <select id="sellRule" onchange="renderParams()"></select>
+    <div id="sellParamBox"></div>
     <label>股票代码（逗号分隔，支持代码/名称搜索）</label>
     <textarea id="codes" placeholder="601882,600519"></textarea>
     <div class="btn-row">
@@ -132,12 +142,52 @@ const $ = id => document.getElementById(id);
 const fmt = (v, d = 2) => v == null ? '-' : Number(v).toLocaleString('zh-CN', { minimumFractionDigits: d, maximumFractionDigits: d });
 const pct = (v, d = 2) => v == null ? '-' : (v > 0 ? '+' : '') + Number(v).toFixed(d) + '%';
 
-// 战法列表
-fetch('/api/backtest/strategies').then(r => r.json()).then(d => {
-  const sel = $('strategy');
-  sel.innerHTML = d.strategies.map(s =>
-    `<option value="${s.key}" title="${s.desc}">${s.name} (${s.key})</option>`).join('');
+// 买入/卖出规则列表（含默认参数与中文标签）
+let RULES = { buy_rules: [], sell_rules: [] };
+fetch('/api/backtest/rules').then(r => r.json()).then(d => {
+  RULES = d;
+  const fill = (id, list) => {
+    $(id).innerHTML = list.map(r =>
+      `<option value="${r.key}" title="${r.desc}">${r.name}</option>`).join('');
+  };
+  fill('buyRule', d.buy_rules);
+  fill('sellRule', d.sell_rules);
+  renderParams();
 });
+
+// 参数动态渲染：中文标签 + 默认值，可下拉折叠
+function renderParams() {
+  const render = (boxId, ruleKey, list, title) => {
+    const r = list.find(x => x.key === $(ruleKey).value) || {};
+    const p = r.default_params || {};
+    const labels = r.param_labels || {};
+    const keys = Object.keys(p);
+    $(boxId).innerHTML =
+      `<details ${keys.length ? 'open' : ''}><summary>${title}（${keys.length} 项）</summary>` +
+      (keys.length ? keys.map(k => {
+        const v = p[k];
+        const type = typeof v === 'number' ? 'number' : 'text';
+        return `<div class="row"><div><label title="${k}">${labels[k] || k}</label>` +
+          `<input type="${type}" data-pkey="${k}" value="${v}" ${type === 'number' ? 'step="any"' : ''}></div></div>`;
+      }).join('') : '<div class="muted" style="font-size:11px">无参数</div>') +
+      '</details>';
+  };
+  render('buyParamBox', 'buyRule', RULES.buy_rules, '买入参数');
+  render('sellParamBox', 'sellRule', RULES.sell_rules, '卖出参数');
+}
+
+function collectParams() {
+  const out = {};
+  ['buyParamBox', 'sellParamBox'].forEach(box => {
+    document.querySelectorAll('#' + box + ' input[data-pkey]').forEach(inp => {
+      const k = inp.dataset.pkey;
+      const raw = inp.value.trim();
+      if (raw === '') return;
+      out[k] = /^[-+]?\d+(\.\d+)?$/.test(raw) ? parseFloat(raw) : raw;
+    });
+  });
+  return out;
+}
 
 // 快捷加载股票池/自选
 async function loadScope(kind) {
@@ -153,7 +203,9 @@ async function run() {
   btn.disabled = true;
   $('statusMsg').textContent = '正在拉取数据并验证（首次需在线取数，请耐心等待）…';
   const body = {
-    strategy: $('strategy').value,
+    buy_rule: $('buyRule').value,
+    sell_rule: $('sellRule').value,
+    params: collectParams(),
     codes: $('codes').value.split(/[,，\s]+/).filter(Boolean),
     period: $('period').value,
     start: $('start').value || '',
@@ -193,6 +245,9 @@ function render(d) {
     { label: '胜利次数', value: m.win_count + ' 胜', cls: 'pos', hint: m.loss_count + ' 负 / 共 ' + m.trade_count + ' 笔' },
     { label: '胜率', value: fmt(m.win_rate_pct) + '%', hint: '' },
     { label: '盈亏比', value: m.profit_loss_ratio == null ? '-' : fmt(m.profit_loss_ratio), hint: '均盈 ' + fmt(m.avg_win) + ' / 均亏 ' + fmt(m.avg_loss) },
+    { label: '买入频率', value: m.avg_buy_interval_days ? '每' + fmt(m.avg_buy_interval_days, 1) + '天1次' : '-', hint: m.buy_days + ' 个交易日有买入' },
+    { label: '次日盈利率', value: m.next_day_win_rate_pct == null ? '-' : fmt(m.next_day_win_rate_pct) + '%', cls: m.next_day_win_rate_pct != null && m.next_day_win_rate_pct > m.win_rate_pct ? 'warn' : '', hint: (m.next_day_win_count ?? 0) + '/' + (m.next_day_total ?? 0) + ' 笔次日收盘盈利' + (m.next_day_win_rate_pct != null && m.next_day_win_rate_pct > m.win_rate_pct ? ' ⚠高于胜率' : '') },
+    { label: '期间+2%比例', value: m.max_gain2_rate_pct == null ? '-' : fmt(m.max_gain2_rate_pct) + '%', cls: m.max_gain2_rate_pct != null && m.max_gain2_rate_pct > m.win_rate_pct ? 'warn' : '', hint: (m.max_gain2_count ?? 0) + '/' + (m.trade_count ?? 0) + ' 笔曾达+2%浮盈' + (m.max_gain2_rate_pct != null && m.max_gain2_rate_pct > m.win_rate_pct ? ' ⚠高于胜率' : '') },
   ].map(c => `<div class="card"><div class="label">${c.label}</div><div class="value ${c.cls || ''}">${c.value}</div><div class="hint">${c.hint}</div></div>`).join('');
 
   const tb = $('tradesBody');
@@ -207,8 +262,10 @@ function render(d) {
 
   const warn = (d.warnings || []).map(w => `<div class="warn">⚠ ${w}</div>`).join('');
   const skip = (d.skipped || []).length ? `<div class="warn">跳过 ${d.skipped.length} 只：${d.skipped.map(s => s.code + '(' + s.reason + ')').join('；')}</div>` : '';
+  const combo = d.config.buy_rule && d.config.sell_rule
+    ? ` ｜ 买入: ${d.config.buy_rule} / 卖出: ${d.config.sell_rule}` : '';
   $('metaBody').innerHTML =
-    `<div>战法：${d.strategy.name} (${d.strategy.key}) ｜ 周期：${d.config.period} ｜ 每笔：${fmt(d.config.amount, 0)} 元` +
+    `<div>战法：${d.strategy.name}${combo} ｜ 周期：${d.config.period} ｜ 每笔：${fmt(d.config.amount, 0)} 元` +
     ` ｜ 手续费：${(d.config.commission_rate * 100).toFixed(1)}‰ ｜ 滑点：${(d.config.slippage_rate * 100).toFixed(1)}‰</div>` +
     `<div>区间：${d.config.start || '数据起点'} ~ ${d.config.end || '数据终点'}` +
     ` ｜ 止盈/止损/持有期：${d.config.take_profit_pct}% / ${d.config.stop_loss_pct}% / ${d.config.max_hold_bars}根</div>` +
