@@ -12,6 +12,10 @@ _verify_*.png
 # 后台下载的失败清单（每次运行重写）
 download_failed.txt
 
+# 回测缓存快照（体积大，走 GitHub Release 附件分发，不入库）
+kline_cache_*.db.gz
+kline_cache_*.db
+
 # Python
 __pycache__/
 *.py[cod]
