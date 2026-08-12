@@ -339,14 +339,16 @@ class BaoStockKline:
                 row = rs.get_row_data()
                 try:
                     if period.endswith("m"):
+                        # BS_FIELDS_MIN: date,time,open,high,low,close,volume,amount
                         # time 形如 20240102100000000，取 HH:MM
                         ts = f"{row[0]} {row[1][8:10]}:{row[1][10:12]}"
-                        o, c, h, l = float(row[2]), float(row[5]), float(row[4]), float(row[3])
+                        o, c, h, l = float(row[2]), float(row[5]), float(row[3]), float(row[4])
                         volume = float(row[6]) / 100.0      # 股 -> 手
                         amount = float(row[7])
                     else:
+                        # BS_FIELDS_DAY: date,open,high,low,close,volume,amount
                         ts = row[0]
-                        o, c, h, l = float(row[1]), float(row[4]), float(row[3]), float(row[2])
+                        o, c, h, l = float(row[1]), float(row[4]), float(row[2]), float(row[3])
                         volume = float(row[5]) / 100.0
                         amount = float(row[6])
                     out.append({"ts": ts, "open": o, "close": c,
