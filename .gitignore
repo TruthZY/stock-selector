@@ -9,6 +9,9 @@ user_pool.json
 reports/
 _verify_*.png
 
+# 后台下载的失败清单（每次运行重写）
+download_failed.txt
+
 # Python
 __pycache__/
 *.py[cod]

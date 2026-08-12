@@ -1,7 +1,9 @@
 # -*- coding: utf-8 -*-
 """回测K线本地缓存：BaoStock 等数据源拉取的长历史K线落 SQLite 复用，
-避免重复拉取触发数据源限速；缓存按天失效（fetched_at 非当天视为过期，
-防止前复权数据随除权漂移影响回测结果）
+避免重复拉取触发数据源限速
+
+缓存长期有效，不按天失效：fetched_at 仅记录最后一次落库日期供排查，
+读取路径不做过期判断（前复权数据随除权漂移的问题由 --force 清缓存重下解决）
 
 表结构独立于实时系统的 kline_daily/kline_min，互不影响
 """
@@ -9,7 +11,7 @@ import sqlite3
 import threading
 import time
 from datetime import datetime
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 import config
 
@@ -92,6 +94,23 @@ class KlineCache:
         if end_ts and self._day_gap(end_ts, kl[-1]["ts"]) > 7:
             return None
         return kl
+
+    def stat(self, code: str, period: str) -> Tuple[int, str, str]:
+        """取该股该周期的缓存概况 (根数, 首根ts, 末根ts)；无缓存返回 (0, "", "")
+
+        只走聚合查询不取全量数据，供下载器判断已有覆盖、统计新增根数用
+        """
+        with self._lock:
+            conn = self._connect()
+            try:
+                row = conn.execute(
+                    "SELECT COUNT(*), MIN(ts), MAX(ts) FROM kline_cache "
+                    "WHERE code=? AND period=?", (code, period)).fetchone()
+            finally:
+                conn.close()
+        if not row or not row[0]:
+            return 0, "", ""
+        return int(row[0]), row[1] or "", row[2] or ""
 
     @staticmethod
     def _day_gap(a: str, b: str) -> int:

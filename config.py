@@ -141,6 +141,29 @@ BACKTEST_DEFAULT = {
 }
 
 
+# ---------------------------------------------------------------------------
+# 后台历史数据下载（python download.py / download.bat）
+# ---------------------------------------------------------------------------
+# 数据源固定为 BaoStock：唯一同时支持 start_date+end_date 区间查询、
+# 不受单次根数上限约束、且日线/分钟线都返回真实成交额的源（前复权）
+DOWNLOAD_DEFAULT = {
+    # 标的范围：pool=股票池 / watch=自选 / all=全市场 / codes=指定代码
+    "scope": "pool",
+    "codes": [],                    # scope=codes 时生效，如 ["600519", "000858"]
+    # 一次下载的K线周期列表（BaoStock 不支持 1m）
+    "periods": ["30m", "daily"],
+    # 下载区间（YYYY-MM-DD；end 为空=今天）
+    "start": "2020-01-01",
+    "end": "",
+    # 更新方式：incremental=只补缺口（默认，每日更新用）/ full=整段重拉覆盖
+    "mode": "incremental",
+    # 每个任务之间的间隔（秒）；BaoStock 持锁期间内部还会再 sleep 0.5s
+    "throttle": 0.5,
+    # 失败清单输出文件（相对本文件所在目录）
+    "failed_file": "download_failed.txt",
+}
+
+
 def load_user_pool() -> list:
     """读取用户配置文件中的股票池（若存在）"""
     if not os.path.exists(CONFIG_FILE):
