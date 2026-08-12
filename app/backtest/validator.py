@@ -293,6 +293,10 @@ class Validator:
         cfg = self.cfg
         base = price if price is not None else (sig.price if sig.price is not None else bar["close"])
         exec_price = base * (1 + cfg.slippage_rate)
+        # 价格无效（停牌等脏数据）不可成交：放过去会以 buy_price=0 建仓，
+        # 平仓时 amount/buy_price 直接 ZeroDivisionError
+        if exec_price <= 0:
+            return
         amount = sig.amount if sig.amount and sig.amount > 0 else cfg.amount
         if amount <= 0:
             return

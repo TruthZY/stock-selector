@@ -38,6 +38,19 @@ def code_to_market(code: str) -> Tuple[str, str]:
     return "sh", f"1.{code}"
 
 
+def valid_bars(bars: List[dict]) -> List[dict]:
+    """剔除价格无效的K线
+
+    停牌日部分数据源仍会返回"K线"，只是价格全为 0（BaoStock 返回 '0E-10'，
+    float() 解析成 0.0 后毫无破绽地流进数据库）。这种行没有成交、价格无意义：
+    留在序列里会污染指标，被当成买点时 买入价=0 会直接 ZeroDivisionError。
+    OHLC 任一 <=0 即整根丢弃——真实成交价不可能为 0
+    """
+    return [k for k in bars
+            if (k.get("open") or 0) > 0 and (k.get("high") or 0) > 0
+            and (k.get("low") or 0) > 0 and (k.get("close") or 0) > 0]
+
+
 def _f(s: str, idx: int, default: float = 0.0) -> float:
     """安全解析字段为浮点数（腾讯接口空字段为 ''）"""
     try:
@@ -374,7 +387,9 @@ class BaoStockKline:
                 asyncio.to_thread(
                     BaoStockKline._fetch_sync, code, period, limit, start_date, end_date),
                 timeout=BaoStockKline._QUERY_TIMEOUT)
-            return data
+            # 下载器直连本类（绕过 DataSource.kline），停牌日的全 0 价格K线
+            # 必须在这里就滤掉
+            return valid_bars(data)
         except asyncio.TimeoutError:
             BaoStockKline._record_hang()   # 查询挂起 = 风控信号，冷却期内不再尝试
             return []
@@ -628,7 +643,9 @@ class DataSource:
                                               start_date=start_date, end_date=end_date),
         ]
         for i, make in enumerate(fetchers):
-            data = await make()
+            # 先清掉无效K线再判 min_len：一个源返回 200 根全 0 的停牌K线
+            # 不该被当成"数据够了"
+            data = valid_bars(await make())
             if data and (len(data) >= min_len or i == len(fetchers) - 1):
                 return data
             if i == len(fetchers) - 1:

@@ -309,6 +309,9 @@ class BacktestEngine:
         cfg = self.cfg
         base = price if price is not None else (sig.price if sig.price is not None else bar["close"])
         exec_price = base * (1 + cfg.slippage_rate)
+        # 价格无效（停牌等脏数据）不可成交，否则下面 amount/exec_price 会除零
+        if exec_price <= 0:
+            return
         if sig.amount and sig.amount > 0:
             amount = min(sig.amount, self.cash)
         else:
