@@ -1,11 +1,19 @@
 # -*- coding: utf-8 -*-
-"""SQLite 存储层：股票池、K线、信号"""
+"""SQLite 存储层：股票池、K线、信号
+
+K线表 klines 按 (code, period, ts) 隔离每个周期。历史上曾用
+kline_daily + kline_min 两张表且无周期列，导致 1m 与 60m 的 ts 撞主键、
+互相顶掉——见 _migrate
+"""
 import sqlite3
 import threading
 import time
 from typing import Dict, List, Optional, Tuple
 
 import config
+
+# schema 版本（PRAGMA user_version）：v1 = klines 取代 kline_daily/kline_min
+_SCHEMA_VERSION = 1
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS stocks (
@@ -14,22 +22,14 @@ CREATE TABLE IF NOT EXISTS stocks (
     market  TEXT DEFAULT '',
     enabled INTEGER DEFAULT 1
 );
-CREATE TABLE IF NOT EXISTS kline_daily (
+CREATE TABLE IF NOT EXISTS klines (
     code   TEXT NOT NULL,
+    period TEXT NOT NULL,
     ts     TEXT NOT NULL,
     open   REAL, high REAL, low REAL, close REAL,
     volume REAL, amount REAL,
-    PRIMARY KEY (code, ts)
+    PRIMARY KEY (code, period, ts)
 );
-CREATE TABLE IF NOT EXISTS kline_min (
-    code   TEXT NOT NULL,
-    ts     TEXT NOT NULL,
-    open   REAL, high REAL, low REAL, close REAL,
-    volume REAL, amount REAL,
-    PRIMARY KEY (code, ts)
-);
-CREATE INDEX IF NOT EXISTS idx_kline_daily ON kline_daily(code);
-CREATE INDEX IF NOT EXISTS idx_kline_min ON kline_min(code);
 CREATE TABLE IF NOT EXISTS signals (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
     ts         TEXT NOT NULL,
@@ -56,14 +56,81 @@ class Store:
         self.db_path = db_path
         self._lock = threading.RLock()
         conn = self._connect()
-        conn.executescript(_SCHEMA)
-        conn.commit()
-        conn.close()
+        try:
+            conn.executescript(_SCHEMA)
+            conn.commit()
+            self._migrate(conn)
+        finally:
+            conn.close()
 
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.db_path, timeout=15)
         conn.execute("PRAGMA journal_mode=WAL")
         return conn
+
+    # ------------------------- 迁移 -------------------------
+
+    def _migrate(self, conn: sqlite3.Connection) -> None:
+        """把旧的 kline_daily/kline_min 迁进带周期的 klines 表（schema v1）
+
+        必须可重入且跨进程安全：Store() 在服务、下载器、回测引擎、验证器
+        四个入口各自构造，可能是并发的独立进程
+        """
+        if conn.execute("PRAGMA user_version").fetchone()[0] >= _SCHEMA_VERSION:
+            return                      # 快路径：已迁移，不取锁
+        # Py3.11 legacy 模式下 DDL 走 autocommit，不置 None 则手动 BEGIN 会报
+        # "cannot start a transaction within a transaction"。仅作用于本连接
+        conn.isolation_level = None
+        # BEGIN IMMEDIATE 立刻取写锁：busy_timeout 救不了「读→写」锁升级，
+        # 那种情况会直接返回 SQLITE_BUSY
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            # 取到写锁后重查版本：否则竞争失败的进程会在 A 提交后继续执行，
+            # 撞 "no such table: kline_daily"——而这发生在 __init__ 里，服务直接起不来
+            if conn.execute("PRAGMA user_version").fetchone()[0] >= _SCHEMA_VERSION:
+                conn.execute("ROLLBACK")
+                return
+            has = {r[0] for r in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'")}
+            moved = {}
+            if "kline_daily" in has:
+                # 日线无损全量搬迁
+                cur = conn.execute(
+                    "INSERT OR IGNORE INTO klines"
+                    "(code,period,ts,open,high,low,close,volume,amount) "
+                    "SELECT code,'daily',ts,open,high,low,close,volume,amount "
+                    "FROM kline_daily")
+                moved["daily"] = cur.rowcount
+                conn.execute("DROP TABLE kline_daily")
+            if "kline_min" in has:
+                # kline_min 混存 1m/30m/60m 且无周期列，1m 的 10:30 与 60m 的 10:30
+                # 逐字节相同，只能按「按天密度」判别：干净日每股 ≤8 根，
+                # 有分钟洪水的日子每股约 240 根。
+                # 必须按天而非按 (股票,天) 判别——个别只被看过图的代码当天恰好只有
+                # 8 根且全是 30m 槽位，按股票判别会误标成 60m
+                cur = conn.execute(
+                    "INSERT OR IGNORE INTO klines"
+                    "(code,period,ts,open,high,low,close,volume,amount) "
+                    "SELECT code,'60m',ts,open,high,low,close,volume,amount "
+                    "FROM kline_min "
+                    "WHERE substr(ts,12,5) IN ('10:30','11:30','14:00','15:00') "
+                    "  AND substr(ts,1,10) IN ("
+                    "        SELECT substr(ts,1,10) FROM kline_min "
+                    "        GROUP BY substr(ts,1,10) "
+                    "        HAVING COUNT(*) <= 8 * ("
+                    "            SELECT COUNT(DISTINCT code) FROM kline_min))")
+                moved["60m"] = cur.rowcount
+                # 余下的 1m 洪水与带洞的 30m（撞车只存下 4/8 根）一并丢弃，
+                # 不可用且可由 _init_history 重新拉取
+                conn.execute("DROP TABLE kline_min")
+            conn.execute(f"PRAGMA user_version={_SCHEMA_VERSION}")
+            conn.execute("COMMIT")
+        except BaseException:
+            conn.execute("ROLLBACK")
+            raise
+        if moved:
+            print("[store] K线表迁移完成: " + ", ".join(
+                f"{p} {n} 行" for p, n in moved.items()), flush=True)
 
     # ------------------------- 股票池 -------------------------
 
@@ -98,8 +165,7 @@ class Store:
             conn = self._connect()
             try:
                 conn.execute("DELETE FROM stocks WHERE code=?", (code,))
-                conn.execute("DELETE FROM kline_daily WHERE code=?", (code,))
-                conn.execute("DELETE FROM kline_min WHERE code=?", (code,))
+                conn.execute("DELETE FROM klines WHERE code=?", (code,))
                 conn.commit()
             finally:
                 conn.close()
@@ -137,55 +203,59 @@ class Store:
 
     # ------------------------- K线 -------------------------
 
-    def upsert_klines(self, code: str, klines: List[dict], table: str = "kline_daily") -> int:
-        """增量写入K线，返回实际写入条数"""
+    def upsert_klines(self, code: str, klines: List[dict], period: str) -> int:
+        """写入某周期K线，返回处理条数
+
+        缺失的K线正常插入；已存在的K线**只允许改写最新两根**——盘中拉到的
+        当前K线是未收盘的残缺值，收盘后必须被纠正，否则永久错误。
+        但不能无条件覆盖：数据源降级链的复权基准并不一致（腾讯分钟线与新浪
+        都不复权，东财/BaoStock 前复权），无条件覆盖会让熔断期间写入的一批K线
+        在基准之间来回翻转，而序列尾部的整体跳变恰是 cross_up 这类只看最后
+        两点的判断最怕的——一次翻转就是一次假金叉。
+        限定最新两根即可：同步间隔 30s 远小于最小周期 30min，一根K线一旦
+        有了更新的邻居，就不可能还是残缺的
+        """
         if not klines:
             return 0
-        assert table in ("kline_daily", "kline_min")
         with self._lock:
             conn = self._connect()
             try:
-                existing = {r[0] for r in conn.execute(
-                    f"SELECT ts FROM {table} WHERE code=?", (code,))}
-                rows = [
-                    (code, k["ts"], k["open"], k["high"], k["low"], k["close"],
-                     k["volume"], k["amount"])
-                    for k in klines if k["ts"] not in existing
-                ]
-                if rows:
-                    conn.executemany(
-                        f"INSERT OR IGNORE INTO {table}(code,ts,open,high,low,close,volume,amount) "
-                        f"VALUES(?,?,?,?,?,?,?,?)", rows)
-                    conn.commit()
-                return len(rows)
+                row = conn.execute(
+                    "SELECT MIN(ts) FROM (SELECT ts FROM klines "
+                    "WHERE code=? AND period=? ORDER BY ts DESC LIMIT 2)",
+                    (code, period)).fetchone()
+                cutoff = (row[0] if row else None) or ""
+                conn.executemany(
+                    "INSERT INTO klines"
+                    "(code,period,ts,open,high,low,close,volume,amount) "
+                    "VALUES(?,?,?,?,?,?,?,?,?) "
+                    "ON CONFLICT(code,period,ts) DO UPDATE SET "
+                    "  open=excluded.open, high=excluded.high, low=excluded.low, "
+                    "  close=excluded.close, volume=excluded.volume, "
+                    "  amount=excluded.amount "
+                    "WHERE excluded.ts >= ?",       # 谓词不满足是 no-op，不报错
+                    [(code, period, k["ts"], k["open"], k["high"], k["low"],
+                      k["close"], k["volume"], k["amount"], cutoff) for k in klines])
+                conn.commit()
+                return len(klines)
             finally:
                 conn.close()
 
-    def get_klines(self, code: str, table: str = "kline_daily",
-                   limit: int = 300) -> List[dict]:
-        assert table in ("kline_daily", "kline_min")
+    def get_klines(self, code: str, period: str, limit: int = 300) -> List[dict]:
+        """取某周期最近 limit 根K线（升序）"""
         with self._lock:
             conn = self._connect()
             try:
                 rows = conn.execute(
-                    f"SELECT ts,open,high,low,close,volume,amount FROM {table} "
-                    f"WHERE code=? ORDER BY ts DESC LIMIT ?", (code, limit)).fetchall()
+                    "SELECT ts,open,high,low,close,volume,amount FROM klines "
+                    "WHERE code=? AND period=? ORDER BY ts DESC LIMIT ?",
+                    (code, period, limit)).fetchall()
             finally:
                 conn.close()
         out = [{"ts": r[0], "open": r[1], "high": r[2], "low": r[3],
                 "close": r[4], "volume": r[5], "amount": r[6]} for r in rows]
         out.reverse()
         return out
-
-    def last_kline_ts(self, code: str, table: str = "kline_daily") -> Optional[str]:
-        with self._lock:
-            conn = self._connect()
-            try:
-                row = conn.execute(
-                    f"SELECT MAX(ts) FROM {table} WHERE code=?", (code,)).fetchone()
-                return row[0] if row else None
-            finally:
-                conn.close()
 
     # ------------------------- 信号 -------------------------
 

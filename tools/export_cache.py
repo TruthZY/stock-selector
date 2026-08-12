@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """导出回测K线缓存为可分发的压缩快照：python tools/export_cache.py [-o 文件名]
 
-只导出 kline_cache 一张表（回测数据），不含实时系统的 kline_daily/kline_min，
+只导出 kline_cache 一张表（回测数据），不含实时系统的 klines 表，
 也不含 stocks/watch/signals 等本机状态 —— 快照是纯行情数据，换机器直接导入即用。
 
 一致性：在源库上开一个读事务后再整表复制，WAL 模式下拿到的是事务开始时刻的

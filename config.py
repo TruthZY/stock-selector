@@ -21,7 +21,22 @@ OFFLINE_KLINE_SYNC_INTERVAL = 300.0
 KLINE_FETCH_COUNT = 8
 # 历史K线初始拉取根数
 DAILY_HISTORY_LIMIT = 300
-MINUTE_HISTORY_LIMIT = 240
+
+# ---------------------------------------------------------------------------
+# 实时系统同步的K线周期
+# ---------------------------------------------------------------------------
+# history：首次启动拉取的根数
+# every：盘中每 N 个同步周期拉一次（错峰，避免同一轮把所有周期都打出去）
+# offline：休市时是否继续同步
+#
+# 不同步 1m：全仓库没有任何地方从数据库读 1m（K线图的 1m 走实时拉取），
+# 它是每天约 28,800 行的纯写放大。历史上 1m 与 60m 共用一张无周期列的表，
+# ts 撞主键导致当日 60m K线被静默顶掉——见 app/store.py 的 _migrate
+REALTIME_PERIODS = {
+    "daily": {"history": DAILY_HISTORY_LIMIT, "every": 2, "offline": True},
+    "60m":   {"history": 240, "every": 2, "offline": False},
+    "30m":   {"history": 480, "every": 2, "offline": False},   # 480根≈60个交易日
+}
 
 # 批量行情每批股票数（腾讯接口建议不超过 60）
 SNAPSHOT_BATCH_SIZE = 50

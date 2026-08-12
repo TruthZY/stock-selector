@@ -33,8 +33,10 @@ class Scanner:
         self.engine = engine
         self.emit = emit                      # 事件广播（WebSocket）
         self.snapshots: Dict[str, dict] = {}  # 最新快照缓存
-        self.daily_cache: Dict[str, List[dict]] = {}
-        self.k60_cache: Dict[str, List[dict]] = {}
+        # K线缓存：period -> code -> 升序K线。按周期隔离，
+        # 早先 daily_cache/k60_cache 两个 dict 读的是同一张混存表，60m 序列被 1m 污染
+        self.bars: Dict[str, Dict[str, List[dict]]] = {
+            p: {} for p in config.REALTIME_PERIODS}
         self._running = False
         self._tasks: List[asyncio.Task] = []
         self.started_at = time.time()
@@ -84,34 +86,28 @@ class Scanner:
         })
 
     async def _init_history(self):
-        """首次启动拉取历史K线（日K + 60分钟K），失败的股票逐个重试补齐"""
+        """首次启动逐周期拉取历史K线，失败的股票逐个重试补齐"""
         stocks = self.store.get_stocks()
         codes = [c for c, _ in stocks]
-        daily = await self.ds.fetch_many_kline(
-            codes, "daily", config.DAILY_HISTORY_LIMIT, config.KLINE_CONCURRENCY)
-        k60 = await self.ds.fetch_many_kline(
-            codes, "60m", config.MINUTE_HISTORY_LIMIT, config.KLINE_CONCURRENCY)
-        # 补齐拉取失败的股票（单个串行重试，降低被限流概率）
-        for code in codes:
-            if code not in daily:
-                data = await self.ds.kline(code, "daily", config.DAILY_HISTORY_LIMIT)
-                if data:
-                    daily[code] = data
-            if code not in k60:
-                data = await self.ds.kline(code, "60m", config.MINUTE_HISTORY_LIMIT)
-                if data:
-                    k60[code] = data
-        for code, kl in daily.items():
-            self.store.upsert_klines(code, kl, "kline_daily")
-        for code, kl in k60.items():
-            self.store.upsert_klines(code, kl, "kline_min")
-        # 重建缓存
-        for code, _ in stocks:
-            self.daily_cache[code] = self.store.get_klines(code, "kline_daily", 400)
-            self.k60_cache[code] = self.store.get_klines(code, "kline_min", 400)
+        loaded = {}
+        for period, cfg in config.REALTIME_PERIODS.items():
+            data = await self.ds.fetch_many_kline(
+                codes, period, cfg["history"], config.KLINE_CONCURRENCY)
+            # 补齐拉取失败的股票（单个串行重试，降低被限流概率）
+            for code in codes:
+                if code not in data:
+                    kl = await self.ds.kline(code, period, cfg["history"])
+                    if kl:
+                        data[code] = kl
+            for code, kl in data.items():
+                self.store.upsert_klines(code, kl, period)
+            for code in codes:
+                self.bars[period][code] = self.store.get_klines(code, period, 400)
+            loaded[period] = len(data)
         await self._broadcast({
             "type": "status",
-            "data": {"msg": f"历史K线加载完成：日K {len(daily)} 只 / 60分钟K {len(k60)} 只"},
+            "data": {"msg": "历史K线加载完成：" + " / ".join(
+                f"{p} {n} 只" for p, n in loaded.items())},
         })
 
     # ------------------------------------------------------------------
@@ -165,11 +161,11 @@ class Scanner:
     def _attach_volume_ratio(self):
         """为快照附加量比（当日成交量/前5日均量），供前端展示；缓存缺失时兜底读库"""
         for code, snap in self.snapshots.items():
-            daily = self.daily_cache.get(code, [])
+            daily = self.bars["daily"].get(code, [])
             if len(daily) <= 5:
-                daily = self.store.get_klines(code, "kline_daily", 400)
+                daily = self.store.get_klines(code, "daily", 400)
                 if daily:
-                    self.daily_cache[code] = daily
+                    self.bars["daily"][code] = daily
             if daily and len(daily) > 5:
                 snap["volume_ratio"] = ta.volume_ratio(
                     snap["volume"], [k["volume"] for k in daily[:-1]])
@@ -183,7 +179,8 @@ class Scanner:
                 continue
             ctx = strat.StockContext(
                 code=code, name=snap.get("name", ""), snap=snap,
-                daily=self.daily_cache.get(code, []),
+                daily=self.bars["daily"].get(code, []),
+                bars=self._bars_of(code),
                 params=self.engine.params,
             )
             for hit in self.engine.evaluate(ctx, kind="snapshot"):
@@ -200,37 +197,39 @@ class Scanner:
         while self._running:
             trading = is_trading_time()
             interval = config.KLINE_SYNC_INTERVAL if trading else config.OFFLINE_KLINE_SYNC_INTERVAL
-            stocks = self.store.get_stocks()
-            codes = [c for c, _ in stocks]
             sync_count += 1
-            # 分钟K线增量（盘中为主）
-            if trading:
-                k1m = await self.ds.fetch_many_kline(
-                    codes, "1m", config.KLINE_FETCH_COUNT, config.KLINE_CONCURRENCY)
-                for code, kl in k1m.items():
-                    self.store.upsert_klines(code, kl, "kline_min")
-            # 日K增量（盘中当日K线实时更新，需周期性刷新）
-            if trading and sync_count % 2 == 0 or not trading:
-                daily = await self.ds.fetch_many_kline(
-                    codes, "daily", config.KLINE_FETCH_COUNT, config.KLINE_CONCURRENCY)
-                for code, kl in daily.items():
-                    self.store.upsert_klines(code, kl, "kline_daily")
-                # 刷新日K缓存，供量比/RSI等实时策略使用
-                for code in daily:
-                    self.daily_cache[code] = self.store.get_klines(code, "kline_daily", 400)
-            # 60分钟K增量（MACD金叉策略依赖，盘中每2轮同步一次，检测延迟≤60秒）
-            if trading and sync_count % 2 == 0:
-                k60 = await self.ds.fetch_many_kline(
-                    codes, "60m", config.KLINE_FETCH_COUNT, config.KLINE_CONCURRENCY)
-                for code, kl in k60.items():
-                    self.store.upsert_klines(code, kl, "kline_min")
-                    self.k60_cache[code] = self.store.get_klines(code, "kline_min", 400)
-            self.last_kline_sync_at = time.time()
-            # K线类策略扫描（休市时K线不变，跳过避免同一信号反复上报）
-            if trading:
-                await self._scan_kline_strategies()
-            await self._broadcast_status("K线增量同步完成")
+            # 整体兜底：这里任何异常若逃逸出去，task 会永久静默死亡
+            # （K线同步与全部K线策略一起停，而快照循环仍在跑，UI 看着完全正常）
+            try:
+                synced = await self._sync_klines(trading, sync_count)
+                self.last_kline_sync_at = time.time()
+                # K线类策略扫描（休市时K线不变，跳过避免同一信号反复上报）
+                if trading:
+                    await self._scan_kline_strategies()
+                await self._broadcast_status(
+                    "K线增量同步完成" + (f"：{', '.join(synced)}" if synced else "（本轮无周期到期）"))
+            except Exception as e:
+                await self._broadcast_status(f"K线同步异常：{type(e).__name__}: {e}")
             await asyncio.sleep(interval)
+
+    async def _sync_klines(self, trading: bool, sync_count: int) -> List[str]:
+        """按 config.REALTIME_PERIODS 逐周期增量同步，返回本轮实际同步的周期"""
+        codes = [c for c, _ in self.store.get_stocks()]
+        synced: List[str] = []
+        for offset, (period, cfg) in enumerate(config.REALTIME_PERIODS.items()):
+            if trading:
+                # 错峰：同一轮不把所有周期都打出去，按周期序号偏移
+                if sync_count % cfg["every"] != offset % cfg["every"]:
+                    continue
+            elif not cfg["offline"]:
+                continue
+            data = await self.ds.fetch_many_kline(
+                codes, period, config.KLINE_FETCH_COUNT, config.KLINE_CONCURRENCY)
+            for code, kl in data.items():
+                self.store.upsert_klines(code, kl, period)
+                self.bars[period][code] = self.store.get_klines(code, period, 400)
+            synced.append(f"{period} {len(data)} 只")
+        return synced
 
     async def _scan_kline_strategies(self):
         pool_codes = {c for c, _ in self.store.get_stocks()}
@@ -239,12 +238,17 @@ class Scanner:
                 continue
             ctx = strat.StockContext(
                 code=code, name=snap.get("name", ""), snap=snap,
-                daily=self.daily_cache.get(code, []),
-                k60=self.k60_cache.get(code, []),
+                daily=self.bars["daily"].get(code, []),
+                k60=self.bars["60m"].get(code, []),
+                bars=self._bars_of(code),
                 params=self.engine.params,
             )
             for hit in self.engine.evaluate(ctx, kind="kline"):
                 await self._emit_signal(ctx, hit)
+
+    def _bars_of(self, code: str) -> Dict[str, List[dict]]:
+        """该股各周期K线，供按周期取用（回测规则适配器用得上）"""
+        return {p: self.bars[p].get(code, []) for p in self.bars}
 
     # ------------------------------------------------------------------
     # 信号与广播

@@ -5,7 +5,7 @@
 本机已有的数据保留，快照里更新的同 ts 行取快照值，新 ts 行插入。
 所以本机跑过 download.py 之后再导入快照也安全。
 
-只写 kline_cache，不碰实时系统的 kline_daily/kline_min，
+只写 kline_cache，不碰实时系统的 klines 表，
 也不动 stocks/watch/signals 等本机状态。
 
 导入后会做一次 OHLC 越界体检（high<low 之类），防止导入被污染的快照。

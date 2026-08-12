@@ -2,10 +2,12 @@
 """后台历史数据下载：逐只（逐周期）把长历史K线灌入回测缓存 kline_cache
 
 与实时数据严格分离，两者用途不同、互不写入：
-- 本模块只写 kline_cache（按 (code, period, ts) 隔离每个周期）→ 供战法验证/回测
-- 实时系统的 kline_daily / kline_min 由 Scanner 写入 → 供盘中实时分析
-  （kline_min 把 1m 与 60m 混存一张表，且用 INSERT OR IGNORE 不修正未收盘K线，
-   这两点对回测都是错的，所以回测数据必须走独立的 kline_cache）
+- 本模块只写 kline_cache → 供战法验证/回测
+- 实时系统的 klines 表由 Scanner 写入 → 供盘中实时分析
+
+之所以要两份而不是共用一张表：回测要的是长历史 + 单一数据源的纵向一致性
+（复权基准中途换源会让指标失真），实时要的是低延迟 + 多源降级容错，
+宁可拿到降级源的数据也不能没有数据。两者要求冲突，所以各存一份
 
 数据源固定 BaoStock，不走 DataSource.kline 的四级降级链，原因：
 - 腾讯/新浪不认日期参数（只认 limit 返回最近 N 根）；东财只认 start_date，

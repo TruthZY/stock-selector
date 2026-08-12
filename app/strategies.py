@@ -20,6 +20,10 @@ class StockContext:
     snap: Optional[dict] = None      # 腾讯实时快照
     daily: List[dict] = field(default_factory=list)   # 日K（升序）
     k60: List[dict] = field(default_factory=list)     # 60分钟K（升序）
+    # 各周期K线 period -> 升序K线，键取自 config.REALTIME_PERIODS。
+    # daily/k60 是其中两个周期的便捷别名（现有策略在用）；
+    # 需要按周期取用（如把回测的 BuyRule 接进来）走这里
+    bars: Dict[str, List[dict]] = field(default_factory=dict)
     params: Dict = field(default_factory=dict)        # 策略参数
 
 

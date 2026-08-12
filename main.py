@@ -198,10 +198,13 @@ async def add_pool(req: dict):
     if not snap:
         return {"ok": False, "msg": f"代码 {code} 行情获取失败，请确认是有效的A股代码"}
     store.upsert_stocks([(code, snap.get("name") or code)])
-    # 立即拉取该股票K线并加入缓存
-    daily = await ds.kline(code, "daily", config.DAILY_HISTORY_LIMIT)
-    store.upsert_klines(code, daily, "kline_daily")
-    scanner.daily_cache[code] = store.get_klines(code, "kline_daily", 400)
+    # 立即拉取该股票各周期历史K线并预热缓存：增量同步每轮只拉 8 根，
+    # 不在此处补足历史的话，新股要好多轮才够 MACD 等策略的最小根数
+    for period, pcfg in config.REALTIME_PERIODS.items():
+        kl = await ds.kline(code, period, pcfg["history"])
+        if kl:
+            store.upsert_klines(code, kl, period)
+        scanner.bars[period][code] = store.get_klines(code, period, 400)
     return {"ok": True, "msg": f"已添加 {snap.get('name')} {code} 到股票池"}
 
 
@@ -209,8 +212,8 @@ async def add_pool(req: dict):
 async def remove_pool(code: str):
     store.remove_stock(code)
     scanner.snapshots.pop(code, None)
-    scanner.daily_cache.pop(code, None)
-    scanner.k60_cache.pop(code, None)
+    for period in scanner.bars:
+        scanner.bars[period].pop(code, None)
     return {"ok": True, "msg": f"已移除 {code}"}
 
 
@@ -242,7 +245,12 @@ async def remove_watch(code: str):
 
 @app.get("/api/kline")
 async def kline(code: str, period: str = "daily", limit: int = 250):
-    """K线图数据：优先本地库，分钟周期按需从东财实时拉取"""
+    """K线图数据：日线读本地库，分钟周期按需实时拉取（20秒进程内缓存）
+
+    分钟周期刻意**不落库**：本接口从不回读数据库，写入纯属副作用，且它是
+    多写者污染源——用户在东财熔断期间打开一张 30m 图，就会用降级源的
+    不复权价格覆盖掉 Scanner 拥有的那条 30m 序列（同一主键、不同复权基准）
+    """
     if period in MIN_PERIODS:
         cache_key = (code, period)
         now = time.time()
@@ -251,10 +259,11 @@ async def kline(code: str, period: str = "daily", limit: int = 250):
             return {"code": code, "period": period, "klines": hit[1]}
         data = await ds.kline(code, period, max(limit, 300))
         if data:
-            store.upsert_klines(code, data, "kline_min")
             kline_cache[cache_key] = (now, data)
         return {"code": code, "period": period, "klines": data}
-    data = store.get_klines(code, "kline_daily", limit)
+    # 写死 daily：period=weekly 等未列入 MIN_PERIODS 的值会落到这里，
+    # 透传会变成查不到数据返回空，保持原有「回退日线」语义
+    data = store.get_klines(code, "daily", limit)
     return {"code": code, "period": period, "klines": data}
 
 

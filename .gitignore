@@ -2,6 +2,7 @@
 kline.db
 kline.db-wal
 kline.db-shm
+kline.db.*.bak
 user_pool.json
 *.log
 
