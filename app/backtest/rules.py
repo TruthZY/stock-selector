@@ -8,11 +8,14 @@
   引擎/验证器按 config.buy_rule + config.sell_rule 构建
 - 每个规则声明 default_params（默认参数）与 PARAM_LABELS（参数中文名），
   前端验证台据此渲染可编辑参数表单
+- 可选声明 PARAM_META：告诉前端该参数的控件形态（枚举单选/多选/时间），
+  否则前端只能按默认值的类型猜（数字→number，其余→自由文本），
+  枚举值要靠手输、拼错了也没提示
 
 新增规则：继承 BuyRule/SellRule + @register_buy(key)/@register_sell(key)
 """
 from abc import ABC, abstractmethod
-from typing import Dict, List, Optional, Type
+from typing import Dict, List, Optional, Tuple, Type
 
 from app import indicators as ta
 from app import patterns as pt
@@ -25,6 +28,17 @@ from app.backtest.strategy import (BarContext, BaseStrategy, Signal,
 # 规则基类与注册机制
 # ---------------------------------------------------------------------------
 
+# PARAM_META 支持的控件类型
+#   select：枚举单选，取 options 之一
+#   multi ：枚举多选，值为逗号分隔字符串；allow_empty=True 时空串是合法语义
+#   time  ：HH:MM 时刻
+# 未声明的参数由前端按默认值类型推断（数字→number，其余→文本）
+
+
+def _opts(*pairs: Tuple[str, str]) -> List[dict]:
+    """构造枚举选项：_opts(("on","开启"), ("off","关闭"))"""
+    return [{"value": v, "label": label} for v, label in pairs]
+
 
 class BuyRule(ABC):
     """买入规则基类：on_bar 返回 buy 信号或 None（由组合层保证无持仓时调用）"""
@@ -34,6 +48,7 @@ class BuyRule(ABC):
     desc: str = ""
     default_params: Dict = {}
     PARAM_LABELS: Dict[str, str] = {}
+    PARAM_META: Dict[str, dict] = {}
 
     def __init__(self):
         self.params: Dict = dict(self.default_params or {})
@@ -60,6 +75,7 @@ class SellRule(ABC):
     desc: str = ""
     default_params: Dict = {}
     PARAM_LABELS: Dict[str, str] = {}
+    PARAM_META: Dict[str, dict] = {}
 
     def __init__(self):
         self.params: Dict = dict(self.default_params or {})
@@ -99,11 +115,12 @@ def register_sell(key: str):
 
 
 def list_rules() -> dict:
-    """列出全部买入/卖出规则（含默认参数与参数中文名），供前端渲染"""
+    """列出全部买入/卖出规则（默认参数 + 中文名 + 控件元信息），供前端渲染"""
     def fmt(reg: Dict[str, Type]) -> List[dict]:
         return [{"key": cls.key, "name": cls.name, "desc": cls.desc,
                  "default_params": dict(cls.default_params or {}),
-                 "param_labels": dict(getattr(cls, "PARAM_LABELS", {}))}
+                 "param_labels": dict(getattr(cls, "PARAM_LABELS", {})),
+                 "param_meta": dict(getattr(cls, "PARAM_META", {}))}
                 for cls in reg.values()]
     return {"buy_rules": fmt(BUY_REGISTRY), "sell_rules": fmt(SELL_REGISTRY)}
 
@@ -145,6 +162,13 @@ class KdjRsiGoldenBuy(BuyRule):
         "pattern_days": "形态统计天数", "max_k": "金叉K值上限(0关)",
         "max_rsi": "金叉RSI上限(0关)", "volume_ratio": "量能倍数(0关)",
         "max_gain_pct": "窗口涨幅上限%(0关)",
+    }
+    PARAM_META = {
+        "after": {"type": "time"},
+        "before": {"type": "time"},
+        "trends": {"type": "multi", "allow_empty": True,
+                   "options": _opts(*cond.TREND_TYPES),
+                   "hint": "全不选 = 不做趋势过滤"},
     }
 
     def reset(self) -> None:
@@ -302,6 +326,7 @@ class KdjGoldenBuy(BuyRule):
     PARAM_LABELS = {"buy_amount": "每笔买入金额(元)", "n": "KDJ周期",
                     "after": "最早买入时间", "before": "最晚买入时间",
                     "max_k": "金叉K值上限(0关)"}
+    PARAM_META = {"after": {"type": "time"}, "before": {"type": "time"}}
 
     def reset(self) -> None:
         super().reset()
@@ -349,6 +374,17 @@ class TrailingDeathCrossSell(SellRule):
         "dead_cross_confirm": "any",    # KDJ死叉确认: none/ma10/peak/any
         "dead_confirm_pct": 3.0,        # 高点回撤确认阈值%
         "rsi_dead_cross": "strict",     # RSI死叉: on/strict(跌破MA5)/off
+    }
+    PARAM_META = {
+        "dead_cross_confirm": {"type": "select", "options": _opts(
+            ("none", "不确认（死叉即卖）"),
+            ("ma10", "收盘跌破MA10"),
+            ("peak", "自高点回撤达阈值"),
+            ("any", "跌破MA10 或 回撤达阈值"))},
+        "rsi_dead_cross": {"type": "select", "options": _opts(
+            ("on", "开启（死叉即卖）"),
+            ("strict", "严格（还需收盘跌破MA5）"),
+            ("off", "关闭"))},
     }
     PARAM_LABELS = {
         "stop_loss_pct": "固定止损%", "trailing_stop_pct": "吊灯回撤%(0关)",
@@ -453,7 +489,10 @@ class DeathCrossSell(SellRule):
     default_params = {"stop_loss_pct": 8.0, "kdj_n": 9,
                       "rsi_dead_cross": "off"}
     PARAM_LABELS = {"stop_loss_pct": "固定止损%", "kdj_n": "KDJ周期",
-                    "rsi_dead_cross": "RSI死叉规则(on/off)"}
+                    "rsi_dead_cross": "RSI死叉"}
+    # 本规则只判断是否等于 "on"，故只有开/关两态
+    PARAM_META = {"rsi_dead_cross": {"type": "select", "options": _opts(
+        ("on", "开启（RSI死叉也卖）"), ("off", "关闭"))}}
 
     def reset(self) -> None:
         super().reset()

@@ -69,6 +69,18 @@
     padding: 4px 2px; user-select: none;
   }
   details summary:hover { color: var(--text); }
+  /* 枚举多选：竖排复选框，窄侧栏里比 select multiple 好点 */
+  .multi-box {
+    display:flex; flex-direction:column; gap:3px;
+    background:var(--bg); border:1px solid var(--border);
+    border-radius:6px; padding:6px 8px;
+  }
+  /* 覆盖基础 label 的 display:block / margin / muted 色 */
+  .multi-item {
+    display:flex; align-items:center; gap:6px;
+    font-size:12px; color:var(--text); cursor:pointer; margin:0;
+  }
+  .multi-item input { width:auto; margin:0; accent-color:#2f81f7; cursor:pointer; }
   #empty { text-align:center; color:var(--muted); padding:60px 0; }
   ::-webkit-scrollbar { width:8px; height:8px; }
   ::-webkit-scrollbar-thumb { background:#30363d; border-radius:4px; }
@@ -172,13 +184,43 @@ function saveRuleParams(ruleType, ruleKey, params) {
 }
 function collectBoxParams(boxId) {
   const out = {};
-  document.querySelectorAll('#' + boxId + ' input[data-pkey]').forEach(inp => {
-    const k = inp.dataset.pkey;
-    const raw = inp.value.trim();
-    if (raw === '') return;
-    out[k] = /^[-+]?\d+(\.\d+)?$/.test(raw) ? parseFloat(raw) : raw;
+  // 单值控件：input（number/text/time）与 select
+  document.querySelectorAll('#' + boxId + ' input[data-pkey], #' + boxId + ' select[data-pkey]')
+    .forEach(el => {
+      const k = el.dataset.pkey;
+      const raw = String(el.value).trim();
+      if (raw === '') return;   // 留空 = 用后端默认值
+      out[k] = /^[-+]?\d+(\.\d+)?$/.test(raw) ? parseFloat(raw) : raw;
+    });
+  // 多选组：值为逗号分隔串。空串是合法语义（如 trends 全不选=不过滤），
+  // 所以不能像单值控件那样"空就跳过"，否则永远回退到默认值、关不掉
+  document.querySelectorAll('#' + boxId + ' [data-multi]').forEach(box => {
+    out[box.dataset.pkey] = Array.from(box.querySelectorAll('input:checked'))
+      .map(i => i.value).join(',');
   });
   return out;
+}
+
+// 按后端 param_meta 渲染控件；未声明的参数按默认值类型推断
+function paramControl(k, v, meta) {
+  const esc = s => String(s).replace(/"/g, '&quot;');
+  if (meta && meta.type === 'select') {
+    return `<select data-pkey="${k}">` + (meta.options || []).map(o =>
+      `<option value="${esc(o.value)}" ${String(v) === o.value ? 'selected' : ''}>${o.label}</option>`
+    ).join('') + '</select>';
+  }
+  if (meta && meta.type === 'multi') {
+    const on = new Set(String(v ?? '').split(',').map(s => s.trim()).filter(Boolean));
+    return `<div data-multi data-pkey="${k}" class="multi-box">` + (meta.options || []).map(o =>
+      `<label class="multi-item"><input type="checkbox" value="${esc(o.value)}" ` +
+      `${on.has(o.value) ? 'checked' : ''}>${o.label}</label>`
+    ).join('') + '</div>' +
+      (meta.hint ? `<div class="muted" style="font-size:11px">${meta.hint}</div>` : '');
+  }
+  const type = meta && meta.type === 'time' ? 'time'
+    : (typeof v === 'number' ? 'number' : 'text');
+  return `<input type="${type}" data-pkey="${k}" value="${esc(v)}" ` +
+    `${type === 'number' ? 'step="any"' : ''}>`;
 }
 
 // 参数动态渲染：中文标签 + 默认值，可下拉折叠；调整后自动缓存到本地
@@ -187,23 +229,22 @@ function renderParams() {
     const r = list.find(x => x.key === $(ruleKey).value) || {};
     const p = r.default_params || {};
     const labels = r.param_labels || {};
+    const metas = r.param_meta || {};
     const saved = savedRuleParams(boxType, $(ruleKey).value) || {};
     const keys = Object.keys(p);
     $(boxId).innerHTML =
       `<details ${keys.length ? 'open' : ''}><summary>${title}（${keys.length} 项）</summary>` +
       (keys.length ? keys.map(k => {
         const v = saved[k] !== undefined ? saved[k] : p[k];
-        const type = typeof v === 'number' ? 'number' : 'text';
         return `<div class="row"><div><label title="${k}">${labels[k] || k}</label>` +
-          `<input type="${type}" data-pkey="${k}" value="${v}" ${type === 'number' ? 'step="any"' : ''}></div></div>`;
+          paramControl(k, v, metas[k]) + '</div></div>';
       }).join('') : '<div class="muted" style="font-size:11px">无参数</div>') +
       '</details>';
-    // 参数调整即缓存（change 事件，输入完成失焦触发）
-    document.querySelectorAll('#' + boxId + ' input[data-pkey]').forEach(inp => {
-      inp.addEventListener('change', () => {
-        saveRuleParams(boxType, $(ruleKey).value, collectBoxParams(boxId));
-      });
-    });
+    // 参数调整即缓存。用赋值而非 addEventListener：renderParams 每次切换战法
+    // 都会重跑，addEventListener 会把监听器越叠越多
+    $(boxId).onchange = () => {
+      saveRuleParams(boxType, $(ruleKey).value, collectBoxParams(boxId));
+    };
   };
   render('buyParamBox', 'buyRule', RULES.buy_rules, '买入参数', 'buy');
   render('sellParamBox', 'sellRule', RULES.sell_rules, '卖出参数', 'sell');

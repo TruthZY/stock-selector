@@ -23,6 +23,16 @@ from app import patterns as pt
 # A股单个交易日的分钟数（4 小时）：用于从K线间隔反推每日根数
 _MINUTES_PER_DAY = 240.0
 
+# classify_trend 的全部返回值及中文名。顺序即判定顺序（见 classify_trend）。
+# 规则据此声明「放行趋势」参数的可选项，前端渲染成多选，避免手输错拼
+TREND_TYPES = [
+    ("steady_up", "一直上涨"),
+    ("up_pullback", "上涨后回调"),
+    ("down_stabilize", "下跌企稳"),
+    ("sideways", "横盘"),
+    ("other", "其他（都不像）"),
+]
+
 
 # ---------------------------------------------------------------------------
 # 内部工具
