@@ -118,7 +118,8 @@ class KdjRsiGoldenBuy(BuyRule):
     """KDJ+RSI 双金叉共振买入（低位/量能/涨幅/趋势/形态过滤）"""
     key = "kdj_rsi_golden"
     name = "KDJ+RSI双金叉共振"
-    desc = "近N根内KDJ与RSI双金叉，11点后，趋势上涨回调/横盘/下落企稳，阳包阴>阴包阳；低位/量能/涨幅过滤"
+    desc = ("近N根内KDJ与RSI双金叉，买入时间窗[after,before]内，趋势上涨回调/横盘/"
+            "下落企稳，阳包阴>阴包阳；低位/量能/涨幅过滤")
     default_params = {
         "buy_amount": 10000.0,      # 每笔固定买入金额（元）
         "kdj_n": 9,                 # KDJ 周期
@@ -126,6 +127,10 @@ class KdjRsiGoldenBuy(BuyRule):
         "rsi_slow": 24,             # RSI 慢线周期
         "golden_window": 3,         # 双金叉判定窗口（根）
         "after": "11:00",           # 最早买入时间 HH:MM
+        "before": "15:00",          # 最晚买入时间 HH:MM（15:00 = 含收盘那根）
+        # 放行的趋势类型，逗号分隔；留空=不做趋势过滤。
+        # 可选 steady_up/up_pullback/sideways/down_stabilize/other
+        "trends": "up_pullback,sideways,down_stabilize",
         "pattern_days": 2,          # 阳包阴/阴包阳统计天数
         "max_k": 55.0,              # 金叉时K值上限（低位过滤，0=关闭）
         "max_rsi": 55.0,            # 金叉时RSI快线上限（0=关闭）
@@ -136,6 +141,7 @@ class KdjRsiGoldenBuy(BuyRule):
         "buy_amount": "每笔买入金额(元)", "kdj_n": "KDJ周期",
         "rsi_fast": "RSI快线周期", "rsi_slow": "RSI慢线周期",
         "golden_window": "双金叉窗口(根)", "after": "最早买入时间",
+        "before": "最晚买入时间", "trends": "放行趋势(留空=不过滤)",
         "pattern_days": "形态统计天数", "max_k": "金叉K值上限(0关)",
         "max_rsi": "金叉RSI上限(0关)", "volume_ratio": "量能倍数(0关)",
         "max_gain_pct": "窗口涨幅上限%(0关)",
@@ -216,17 +222,22 @@ class KdjRsiGoldenBuy(BuyRule):
                 return None
             reasons.append(f"窗口涨{gain:.1f}%")
 
-        # 5. 时间条件
-        hit, r = cond.time_between(ctx.bars, ctx.i, after=str(self.params["after"]))
+        # 5. 时间条件（双边窗口，before 必须显式传，否则会取到函数默认上限）
+        hit, r = cond.time_between(ctx.bars, ctx.i,
+                                   after=str(self.params["after"]),
+                                   before=str(self.params.get("before") or "15:00"))
         if not hit:
             return None
         reasons.append(r)
 
-        # 6. 趋势：上涨回调/横盘/下落企稳
-        trend = cond.classify_trend(ctx.bars, ctx.i)
-        if trend not in ("up_pullback", "sideways", "down_stabilize"):
-            return None
-        reasons.append(f"趋势:{trend}")
+        # 6. 趋势过滤（trends 留空=关闭）
+        allow = {t.strip() for t in str(self.params.get("trends") or "").split(",")
+                 if t.strip()}
+        if allow:
+            trend = cond.classify_trend(ctx.bars, ctx.i)
+            if trend not in allow:
+                return None
+            reasons.append(f"趋势:{trend}")
 
         # 7. 形态：近 pattern_days 个交易日内阳包阴 > 阴包阳
         day_set = set()
@@ -285,10 +296,12 @@ class KdjGoldenBuy(BuyRule):
     """KDJ 金叉买入（低位过滤）"""
     key = "kdj_golden"
     name = "KDJ金叉"
-    desc = "KDJ 金叉买入，可加时间与低位过滤"
-    default_params = {"buy_amount": 10000.0, "n": 9, "after": "09:30", "max_k": 0.0}
+    desc = "KDJ 金叉买入，可加买入时间窗[after,before]与低位过滤"
+    default_params = {"buy_amount": 10000.0, "n": 9,
+                      "after": "09:30", "before": "15:00", "max_k": 0.0}
     PARAM_LABELS = {"buy_amount": "每笔买入金额(元)", "n": "KDJ周期",
-                    "after": "最早买入时间", "max_k": "金叉K值上限(0关)"}
+                    "after": "最早买入时间", "before": "最晚买入时间",
+                    "max_k": "金叉K值上限(0关)"}
 
     def reset(self) -> None:
         super().reset()
@@ -310,7 +323,9 @@ class KdjGoldenBuy(BuyRule):
         max_k = float(self.params.get("max_k") or 0)
         if max_k > 0 and self._k[ctx.i] > max_k:
             return None
-        hit, _ = cond.time_between(ctx.bars, ctx.i, after=str(self.params["after"]))
+        hit, _ = cond.time_between(ctx.bars, ctx.i,
+                                   after=str(self.params["after"]),
+                                   before=str(self.params.get("before") or "15:00"))
         if not hit:
             return None
         return Signal("buy", amount=float(self.params["buy_amount"]),

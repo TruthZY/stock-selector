@@ -9,15 +9,19 @@
 战法用法示例：
     from app.backtest import conditions as cond
     hit, reason = cond.kdj_golden_cross(ctx.bars, ctx.i, n=9)
-    hit2, _ = cond.time_between(ctx.bars, ctx.i, after="09:30", before="14:30")
+    hit2, _ = cond.time_between(ctx.bars, ctx.i, after="09:30", before="15:00")
 
 注意：本库为无状态纯函数，高频调用（如每根K线重算 KDJ）建议在战法
 prepare() 中预计算指标序列并缓存，on_bar 内只做 O(1) 判断。
 """
+import math
 from typing import Optional, Tuple
 
 from app import indicators as ta
 from app import patterns as pt
+
+# A股单个交易日的分钟数（4 小时）：用于从K线间隔反推每日根数
+_MINUTES_PER_DAY = 240.0
 
 
 # ---------------------------------------------------------------------------
@@ -27,6 +31,24 @@ from app import patterns as pt
 def _pct(a: float, b: float) -> float:
     """涨幅百分比：(b/a - 1) * 100"""
     return (b - a) / a * 100.0 if a else 0.0
+
+
+def _bars_per_day(bars: list, i: int) -> float:
+    """从相邻K线的时间间隔推断每个交易日的K线根数；日K/周K 返回 1
+
+    只看同一交易日内相邻的两根，O(1)。用于把「按日线量级设定的阈值」
+    折算到分钟周期（见 sideways）"""
+    if len(bars[i]["ts"]) <= 10:
+        return 1.0
+    for j in range(i, max(1, i - 10), -1):
+        a, b = bars[j - 1]["ts"], bars[j]["ts"]
+        if len(a) <= 10 or a[:10] != b[:10]:
+            continue
+        mins = ((int(b[11:13]) * 60 + int(b[14:16]))
+                - (int(a[11:13]) * 60 + int(a[14:16])))
+        if mins > 0:
+            return max(1.0, _MINUTES_PER_DAY / mins)
+    return 1.0
 
 
 def _cross_at(a: list, b: list, i: int, up: bool = True) -> bool:
@@ -99,9 +121,14 @@ def rsi_dead_cross(bars: list, i: int, fast: int = 6, slow: int = 12) -> Tuple[b
 # 2. 时间条件（分钟K）
 # ---------------------------------------------------------------------------
 
-def time_between(bars: list, i: int, after: str = "09:30", before: str = "14:30") -> Tuple[bool, str]:
-    """时间窗条件：当前K线时间在 [after, before] 内（HH:MM）
-    日K/周K等无时分信息的K线视为满足（时间条件仅对分钟K有意义）"""
+def time_between(bars: list, i: int, after: str = "09:30", before: str = "15:00") -> Tuple[bool, str]:
+    """时间窗条件：当前K线时间在 [after, before] 内（HH:MM），**双边闭区间**
+
+    日K/周K等无时分信息的K线视为满足（时间条件仅对分钟K有意义）
+
+    注意 before 是真实上限，不传不等于"不限"。默认取 15:00（A股收盘）而非
+    盘中某个时刻：此前默认 14:30，导致只传 after 的规则在 30m 上把 15:00
+    那根的信号全部静默丢掉（实测 5 只股票 2.5 年丢掉 31 个候选）"""
     ts = bars[i]["ts"]
     if len(ts) <= 10:
         return True, "日K无时间限制"
@@ -151,16 +178,27 @@ def uptrend_pullback(bars: list, i: int, up_lookback: int = 20, up_pct: float = 
 
 
 def sideways(bars: list, i: int, lookback: int = 10, range_pct: float = 5.0) -> Tuple[bool, str]:
-    """横盘趋势：最近 lookback 根内 (最高-最低)/最低 <= range_pct%"""
+    """横盘趋势：最近 lookback 根内 (最高-最低)/最低 <= range_pct%
+
+    阈值按周期自适应。range_pct 的语义是「lookback 根**日线**的振幅上限」；
+    同样根数的分钟K覆盖的时间短得多，振幅自然小，直接套用会几乎恒真——
+    实测 30m 上 10 根振幅中位数仅 1.6~2.1%，而日线是 5.3~6.9%，
+    于是 <=5% 在 30m 上覆盖 95~98% 的样本，横盘判定完全失效。
+
+    折算依据：波动率随时间开方缩放，窗口覆盖的交易日数为 lookback/每日根数，
+    故阈值除以 sqrt(每日根数)。30m（每日 8 根）→ 5% / sqrt(8) = 1.77%，
+    与「让 30m 达到与日线相当选择性」的实测阈值 1.5% 接近。日线不变"""
     if i + 1 < lookback:
         return False, "数据不足"
+    bpd = _bars_per_day(bars, i)
+    limit = range_pct / math.sqrt(bpd)
     window = bars[i - lookback + 1:i + 1]
     lo = min(k["low"] for k in window)
     hi = max(k["high"] for k in window)
     rng = (hi - lo) / lo * 100.0 if lo else 0.0
-    if rng > range_pct:
-        return False, f"振幅{rng:.1f}%超过{range_pct}%"
-    return True, f"横盘：{lookback}根振幅{rng:.1f}%"
+    if rng > limit:
+        return False, f"振幅{rng:.1f}%超过{limit:.1f}%"
+    return True, f"横盘：{lookback}根振幅{rng:.1f}%(上限{limit:.1f}%)"
 
 
 def downtrend_stabilizing(bars: list, i: int, down_lookback: int = 20, down_pct: float = 8.0,
@@ -188,9 +226,16 @@ def downtrend_stabilizing(bars: list, i: int, down_lookback: int = 20, down_pct:
 def classify_trend(bars: list, i: int, **kwargs) -> str:
     """趋势分类辅助：按默认参数（或 kwargs 覆盖）返回首个命中的趋势类型
     返回 steady_up / up_pullback / sideways / down_stabilize / other
-    例：classify_trend(bars, i, up_pct=6.0) 可调整上涨后回调的涨幅阈值"""
+
+    sideways 放在**最后**判定：它是「都不像」的兜底形态，语义上最宽松。
+    早先排在 down_stabilize 之前，配合失效的振幅阈值抢先命中 95% 的K线，
+    导致 down_stabilize 永远不会被返回（死分支）。
+
+    例：classify_trend(bars, i, up_pct=6.0) 可调整上涨后回调的涨幅阈值。
+    注意 kwargs 按各函数签名过滤，`lookback` 同时是 steady_uptrend 与
+    sideways 的参数名，传入会同时作用于两者"""
     checks = [("steady_up", steady_uptrend), ("up_pullback", uptrend_pullback),
-              ("sideways", sideways), ("down_stabilize", downtrend_stabilizing)]
+              ("down_stabilize", downtrend_stabilizing), ("sideways", sideways)]
     import inspect
     for name, fn in checks:
         params = {k: v for k, v in kwargs.items()
