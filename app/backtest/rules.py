@@ -114,8 +114,34 @@ def register_sell(key: str):
     return deco
 
 
+_user_loaded = False
+
+
+def _ensure_user_rules(force: bool = False) -> dict:
+    """惰性加载 config.USER_RULES_DIR 下的用户脚本
+
+    在函数体内 import 而非模块顶部：用户脚本会 `from app.backtest.rules import
+    BuyRule`，模块级导入会造成 rules → user_rules → rules 的循环导入
+    （与 strategy.py 的 _ensure_registered 同一手法）
+    """
+    global _user_loaded
+    if _user_loaded and not force:
+        from app.backtest.user_rules import last_report
+        return last_report()
+    from app.backtest.user_rules import load_user_rules
+    _user_loaded = True
+    return load_user_rules()
+
+
+def reload_user_rules() -> dict:
+    """强制重新加载用户脚本，返回加载报告（供重载端点/CLI 调用）"""
+    return _ensure_user_rules(force=True)
+
+
 def list_rules() -> dict:
     """列出全部买入/卖出规则（默认参数 + 中文名 + 控件元信息），供前端渲染"""
+    _ensure_user_rules()
+
     def fmt(reg: Dict[str, Type]) -> List[dict]:
         return [{"key": cls.key, "name": cls.name, "desc": cls.desc,
                  "default_params": dict(cls.default_params or {}),
@@ -623,6 +649,7 @@ def build_strategy(cfg) -> BaseStrategy:
     """按配置构建策略实例：优先 买入规则+卖出规则 组合；否则按整包战法 key。
     cfg 需含 buy_rule/sell_rule/strategy/params 字段（engine/validator 配置类）
     """
+    _ensure_user_rules()        # 用户脚本也能被 --buy-rule / 验证台选中
     buy_key = getattr(cfg, "buy_rule", "") or ""
     sell_key = getattr(cfg, "sell_rule", "") or ""
     if buy_key and sell_key:

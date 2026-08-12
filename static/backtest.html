@@ -280,17 +280,35 @@ async function run() {
     stop_loss_pct: parseFloat($('stopLoss').value) || 0,
     max_hold_bars: parseInt($('maxHold').value) || 0,
   };
+  // POST 是长请求，进度靠并发轮询另一个端点拿
+  const timer = setInterval(pollProgress, 700);
   try {
     const d = await fetch('/api/backtest/run', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body),
     }).then(r => r.json());
+    clearInterval(timer);   // 必须先停：否则末尾的 tick 会盖掉 render 写的完成信息
     render(d);
   } catch (e) {
+    clearInterval(timer);
     $('statusMsg').textContent = '运行失败: ' + e.message;
   } finally {
+    clearInterval(timer);
     btn.disabled = false;
   }
+}
+
+const PHASE_LABEL = { start: '准备', load: '取数', prepare: '预热指标', simulate: '撮合' };
+async function pollProgress() {
+  try {
+    const p = await fetch('/api/backtest/progress').then(r => r.json());
+    if (!p.running) return;
+    const pct = p.total ? Math.floor(p.done / p.total * 100) : 0;
+    const label = PHASE_LABEL[p.phase] || p.phase;
+    $('statusMsg').textContent =
+      `${label} ${p.done}/${p.total}（${pct}%）` +
+      (p.code ? ` ${p.code}` : '') + ` · 已用 ${p.elapsed.toFixed(0)}s`;
+  } catch (e) { /* 轮询失败不影响主请求 */ }
 }
 
 function render(d) {

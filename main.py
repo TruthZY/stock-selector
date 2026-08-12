@@ -64,6 +64,9 @@ scan_cache: dict = {}           # (pattern, period, window, day, scope) -> (ts, 
 SCAN_CACHE_TTL = 30.0
 SCAN_CACHE_TTL_ALL = 300.0      # 全市场扫描成本高，缓存更久
 all_stocks_cache = {"ts": 0.0, "data": []}   # 全市场股票列表缓存（1小时）
+# 当前验证/回测进度：单用户单槽位，原地 mutate（前端在 POST 进行中并发轮询读取）
+run_progress = {"running": False, "phase": "", "done": 0, "total": 0,
+                "code": "", "elapsed": 0.0, "ts": 0.0}
 
 # 分钟周期与东财参数的映射（用于按需拉取K线图数据）
 MIN_PERIODS = {"1m": 1, "5m": 5, "15m": 15, "30m": 30, "60m": 60}
@@ -105,16 +108,55 @@ async def backtest_strategies():
 
 @app.get("/api/backtest/rules")
 async def backtest_rules():
-    """买入/卖出规则列表（含默认参数与参数中文名），供验证台拆分选择"""
+    """买入/卖出规则列表（含默认参数、参数中文名与控件类型），供验证台拆分选择
+
+    附带 user_rules 加载报告，让加载失败/性能不合格的脚本在界面上可见，
+    而不是"脚本写了但下拉里就是没有"
+    """
     from app.backtest.rules import list_rules
-    return list_rules()
+    from app.backtest.user_rules import last_report
+    data = list_rules()
+    data["user_rules"] = last_report()
+    return data
 
 
 @app.post("/api/backtest/run")
 async def backtest_run(req: dict):
-    """运行信号验证：固定金额单笔核算，输出总盈亏/胜率/买卖时机清单"""
+    """运行信号验证：固定金额单笔核算，输出总盈亏/胜率/买卖时机清单
+
+    进度写入模块级 run_progress，前端在本请求进行中并发轮询 /api/backtest/progress
+    """
     from app.backtest.validator import run_validator
-    return await run_validator(req)
+
+    def on_progress(ev: dict):
+        run_progress.update({"running": True, "phase": ev["phase"],
+                             "done": ev["done"], "total": ev["total"],
+                             "code": ev.get("code", ""),
+                             "elapsed": ev.get("elapsed", 0.0), "ts": time.time()})
+
+    run_progress.update({"running": True, "phase": "start", "done": 0, "total": 0,
+                         "code": "", "elapsed": 0.0, "ts": time.time()})
+    try:
+        return await run_validator(req, on_progress=on_progress)
+    finally:
+        run_progress.update({"running": False, "ts": time.time()})
+
+
+@app.get("/api/backtest/progress")
+async def backtest_progress():
+    """当前验证进度（供前端在运行中轮询）"""
+    return dict(run_progress)
+
+
+@app.post("/api/backtest/rules/reload")
+async def backtest_rules_reload():
+    """重新加载 user_rules/ 下的自定义战法脚本，返回加载报告
+
+    只重新读取磁盘上已有的文件、不接收任何代码：能写该目录的人本来就能执行代码，
+    所以此端点不引入新的执行面
+    """
+    from app.backtest.rules import reload_user_rules
+    return reload_user_rules()
 
 
 @app.get("/api/status")

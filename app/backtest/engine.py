@@ -6,6 +6,7 @@
 - 策略只负责 on_bar 信号，通过 app.backtest.strategy 接口扩展
 """
 import asyncio
+import time
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple
@@ -63,8 +64,13 @@ class BacktestConfig:
 class BacktestEngine:
     """固定流程回测引擎"""
 
-    def __init__(self, cfg: BacktestConfig):
+    # 撮合阶段每多少根K线上报一次进度：事件循环有几十万次迭代，逐根回调太贵
+    PROGRESS_EVERY_BARS = 50
+
+    def __init__(self, cfg: BacktestConfig, on_progress=None):
         self.cfg = cfg
+        self.on_progress = on_progress
+        self._started_at = time.time()
         self.ds = DataSource()
         self.store = Store()
         self.cache = KlineCache()
@@ -77,6 +83,18 @@ class BacktestEngine:
         self.pending: Dict[str, Signal] = {}      # next_open 模式延迟信号
         self.bars_map: Dict[str, List[dict]] = {} # 预处理后的K线（供策略钩子取用）
         self.warnings: List[str] = []             # 数据覆盖不足等警告
+        self._rule_errors: set = set()            # 已记录的战法异常，用于去重
+
+    def _emit(self, phase: str, done: int, total: int, code: str = "") -> None:
+        """上报进度；回调异常不影响回测（与 Downloader._emit 同策略）"""
+        if not self.on_progress:
+            return
+        try:
+            self.on_progress({"type": "progress", "phase": phase, "done": done,
+                              "total": total, "code": code,
+                              "elapsed": time.time() - self._started_at})
+        except Exception:
+            pass
 
     # ------------------------- 主流程 -------------------------
 
@@ -93,14 +111,18 @@ class BacktestEngine:
         warmup_start = self._warmup_start()
         data: Dict[str, List[dict]] = {}
         cache_hits = 0
-        for code in list(names):
+        for n, code in enumerate(list(names), 1):
+            self._emit("load", n, len(names), code)
+            await asyncio.sleep(0)      # 缓存全命中时本循环不会挂起，需主动让出
             kl, from_cache = await load_kline_merged(
                 self.ds, self.cache, code, cfg.period, need, warmup_start, cfg.end)
             if from_cache and kl:
                 cache_hits += 1
             if kl:
                 data[code] = kl
-            await asyncio.sleep(FETCH_THROTTLE_SECONDS)
+            # 只在真正联网时节流（缓存命中无需防限流，见 validator 同处注释）
+            if not from_cache:
+                await asyncio.sleep(FETCH_THROTTLE_SECONDS)
         self.data_source = {"cache_hits": cache_hits, "fetched": len(data) - cache_hits}
         bars_map, skipped = self._prepare_data(data, names)
         if not bars_map:
@@ -132,14 +154,31 @@ class BacktestEngine:
             self.warnings.append(
                 f"数据源最新到 {timeline[-1]}，实际回测终点为 {timeline[-1]}（配置为 {cfg.end}）")
 
-        # 每只股票独立的策略实例（状态隔离）：reset + prepare 预计算指标
-        for code in codes_ok:
-            st = build_strategy(cfg)
-            st.prepare(bars_map[code])
+        # 每只股票独立的策略实例（状态隔离）：reset + prepare 预计算指标。
+        # 构建/预计算里执行的是（可能是用户写的）战法代码，抛异常只跳过该只
+        for n, code in enumerate(codes_ok, 1):
+            self._emit("prepare", n, len(codes_ok), code)
+            await asyncio.sleep(0)      # prepare 是纯 CPU，需让出
+            try:
+                st = build_strategy(cfg)
+                st.prepare(bars_map[code])
+            except Exception as e:
+                skipped.append({"code": code, "name": names.get(code, code),
+                                "reason": f"战法初始化失败：{type(e).__name__}: {e}"})
+                continue
             self.strategies[code] = st
+        codes_ok = [c for c in codes_ok if c in self.strategies]
+        if not codes_ok:
+            return self._result(ok=False, msg="所有标的的战法初始化都失败了",
+                                skipped=skipped)
 
         # 事件循环：逐时间点推进所有股票
-        for ts in timeline:
+        for n, ts in enumerate(timeline, 1):
+            if n % self.PROGRESS_EVERY_BARS == 0 or n == len(timeline):
+                self._emit("simulate", n, len(timeline), ts)
+                # 让出一次事件循环：撮合是纯 CPU 循环、没有 await 会挂起，
+                # 不让出的话同进程内的 HTTP 端点在整场跑完前都得不到调度
+                await asyncio.sleep(0)
             for code in codes_ok:
                 idx = ts_index[code].get(ts)
                 if idx is None:
@@ -175,10 +214,14 @@ class BacktestEngine:
                     self._sell(code, names[code], bar, pos, risk, idx)
                     continue
 
-                # 2. 策略信号
+                # 2. 策略信号（用户战法异常视为本根无信号，不中断整场回测）
                 st = self.strategies[code]
                 ctx = BarContext(code, names[code], bars_map[code], idx, pos, st.params)
-                sig = st.on_bar(ctx)
+                try:
+                    sig = st.on_bar(ctx)
+                except Exception as e:
+                    self._rule_error(code, "on_bar", e)
+                    continue
                 if sig is None or sig.action not in ("buy", "sell"):
                     continue
                 if sig.action == "buy":
@@ -327,8 +370,12 @@ class BacktestEngine:
         self.positions[code] = pos
         st = self.strategies.get(code)
         if st is not None:
-            st.on_position_opened(BarContext(code, name, self.bars_map.get(code) or [],
-                                             idx, pos, st.params), pos)
+            try:
+                st.on_position_opened(
+                    BarContext(code, name, self.bars_map.get(code) or [],
+                               idx, pos, st.params), pos)
+            except Exception as e:
+                self._rule_error(code, "on_position_opened", e)
 
     def _sell(self, code: str, name: str, bar: dict, pos: Position, sig: Signal,
               idx: int) -> None:
@@ -349,8 +396,23 @@ class BacktestEngine:
         del self.positions[code]
         st = self.strategies.get(code)
         if st is not None:
-            st.on_position_closed(BarContext(code, name, self.bars_map.get(code) or [],
-                                             idx, None, st.params), pos)
+            try:
+                st.on_position_closed(
+                    BarContext(code, name, self.bars_map.get(code) or [],
+                               idx, None, st.params), pos)
+            except Exception as e:
+                self._rule_error(code, "on_position_closed", e)
+
+    def _rule_error(self, code: str, phase: str, e: Exception) -> None:
+        """记录战法异常并继续。同一 (股票, 阶段, 异常类型) 只记一条——
+        事件循环有几十万次迭代，不去重会把 warnings 刷爆"""
+        key = (code, phase, type(e).__name__)
+        if key in self._rule_errors:
+            return
+        self._rule_errors.add(key)
+        self.warnings.append(
+            f"{code} 战法 {phase} 异常（已忽略，后续同类不再重复报告）："
+            f"{type(e).__name__}: {e}")
 
     # ------------------------- 结果 -------------------------
 
@@ -379,11 +441,14 @@ class BacktestEngine:
         }
 
 
-async def run_backtest(cfg) -> dict:
-    """运行回测（cfg 为 BacktestConfig 或 dict），自动释放数据源连接"""
+async def run_backtest(cfg, on_progress=None) -> dict:
+    """运行回测（cfg 为 BacktestConfig 或 dict），自动释放数据源连接
+
+    on_progress: 可选进度回调，收到 {type,phase,done,total,code,elapsed}
+    """
     if isinstance(cfg, dict):
         cfg = BacktestConfig.from_dict(cfg)
-    engine = BacktestEngine(cfg)
+    engine = BacktestEngine(cfg, on_progress=on_progress)
     try:
         return await engine.run()
     finally:

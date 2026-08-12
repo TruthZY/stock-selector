@@ -35,6 +35,41 @@ def _parse_params(s: str) -> dict:
     return out
 
 
+_PHASE_LABEL = {"load": "取数", "prepare": "预热指标", "simulate": "撮合"}
+
+
+def _progress_printer():
+    """回测进度打印
+
+    终端下用 \\r 原地刷新；被重定向到文件/管道时 \\r 会糊成一行，
+    改为只在阶段切换和每 25% 打一行
+    """
+    tty = getattr(sys.stdout, "isatty", lambda: False)()
+    state = {"phase": "", "mark": -1}
+
+    def emit(ev: dict) -> None:
+        phase, done, total = ev["phase"], ev["done"], ev["total"]
+        pct = int(done / total * 100) if total else 0
+        label = _PHASE_LABEL.get(phase, phase)
+        new_phase = phase != state["phase"]
+        if new_phase:
+            state.update(phase=phase, mark=-1)
+        line = (f"  {label} {done}/{total} ({pct}%) {ev.get('code', ''):<20}"
+                f" 已用 {ev.get('elapsed', 0):.0f}s")
+        if tty:
+            print(f"\r{line}", end="", flush=True)
+            if done >= total:
+                print(flush=True)
+                state["phase"] = ""
+            return
+        # 非终端：稀疏输出
+        step = pct // 25
+        if new_phase or step > state["mark"] or done >= total:
+            state["mark"] = step
+            print(line, flush=True)
+    return emit
+
+
 def _print_summary(result: dict) -> None:
     m = result.get("metrics") or {}
     cfg = result.get("config") or {}
@@ -131,7 +166,7 @@ def main():
         d["strategy"] = "combo"
     cfg = BacktestConfig.from_dict(d)
 
-    result = asyncio.run(run_backtest(cfg))
+    result = asyncio.run(run_backtest(cfg, on_progress=_progress_printer()))
     _print_summary(result)
     if result.get("ok") and not args.no_report:
         paths = build_report(result)

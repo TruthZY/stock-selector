@@ -8,6 +8,7 @@
 串行拉取），但撮合模型简化为"单笔独立核算"，不生成资金曲线。
 """
 import asyncio
+import time
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple
@@ -77,17 +78,34 @@ class Validator:
     # 买入质量判定：持仓期间曾达到该涨幅（%）视为"曾经盈利"
     QUALITY_GAIN_PCT = 2.0
 
-    def __init__(self, cfg: ValidatorConfig):
+    # 撮合阶段每多少根K线上报一次进度：事件循环有几十万次迭代，逐根回调太贵
+    PROGRESS_EVERY_BARS = 50
+
+    def __init__(self, cfg: ValidatorConfig, on_progress=None):
         self.cfg = cfg
         self.ds = DataSource()
         self.store = Store()
         self.cache = KlineCache()
+        self.on_progress = on_progress
+        self._started_at = time.time()
         self.warnings: List[str] = []
+        self._rule_errors: set = set()            # 已记录的战法异常，用于去重
         self.positions: Dict[str, List[VPosition]] = {}   # code -> 持仓列表（多笔独立）
         self.trades: List[dict] = []
         self.pending_buy: Dict[str, Signal] = {}           # next_open 买入延迟
         self.pending_sells: Dict[str, Dict[str, Signal]] = {}  # code -> {buy_ts: T+1顺延卖出}
         self.strategies: Dict[str, object] = {}
+
+    def _emit(self, phase: str, done: int, total: int, code: str = "") -> None:
+        """上报进度；回调异常不影响验证（与 Downloader._emit 同策略）"""
+        if not self.on_progress:
+            return
+        try:
+            self.on_progress({"type": "progress", "phase": phase, "done": done,
+                              "total": total, "code": code,
+                              "elapsed": time.time() - self._started_at})
+        except Exception:
+            pass
 
     # ------------------------- 主流程 -------------------------
 
@@ -103,14 +121,19 @@ class Validator:
         warmup_start = self._warmup_start()
         data: Dict[str, List[dict]] = {}
         cache_hits = 0
-        for code in list(names):
+        for n, code in enumerate(list(names), 1):
+            self._emit("load", n, len(names), code)
+            await asyncio.sleep(0)      # 缓存全命中时本循环也不会挂起，需主动让出
             kl, from_cache = await load_kline_merged(
                 self.ds, self.cache, code, cfg.period, need, warmup_start, cfg.end)
             if from_cache and kl:
                 cache_hits += 1
             if kl:
                 data[code] = kl
-            await asyncio.sleep(FETCH_THROTTLE_SECONDS)
+            # 只在真正联网时节流。此前无条件 sleep：全池 121 只即便全部命中缓存
+            # 也要空等 60 秒（实测总耗时 72 秒里 60 秒是纯睡眠）
+            if not from_cache:
+                await asyncio.sleep(FETCH_THROTTLE_SECONDS)
         bars_map, skipped = self._prepare_data(data, names)
         if not bars_map:
             return self._result(ok=False, msg="无可用K线数据（数据源不可用或数据不足）",
@@ -136,14 +159,31 @@ class Validator:
             self.warnings.append(
                 f"数据源仅覆盖 {timeline[0]} 起，实际验证起点为 {timeline[0]}（配置为 {cfg.start}）")
 
-        # 每只股票独立策略实例
-        for code in codes_ok:
-            st = build_strategy(cfg)
-            st.prepare(bars_map[code])
+        # 每只股票独立策略实例。构建/预计算执行的是（可能是用户写的）战法代码，
+        # 抛异常只跳过该只
+        for n, code in enumerate(codes_ok, 1):
+            self._emit("prepare", n, len(codes_ok), code)
+            await asyncio.sleep(0)      # 同上：prepare 也是纯 CPU，需让出
+            try:
+                st = build_strategy(cfg)
+                st.prepare(bars_map[code])
+            except Exception as e:
+                skipped.append({"code": code, "name": names.get(code, code),
+                                "reason": f"战法初始化失败：{type(e).__name__}: {e}"})
+                continue
             self.strategies[code] = st
+        codes_ok = [c for c in codes_ok if c in self.strategies]
+        if not codes_ok:
+            return self._result(ok=False, msg="所有标的的战法初始化都失败了",
+                                skipped=skipped)
 
         # 事件循环：逐时间点推进；多笔独立持仓，每根K线内先逐笔评估卖出、再评估买入
-        for ts in timeline:
+        for n, ts in enumerate(timeline, 1):
+            if n % self.PROGRESS_EVERY_BARS == 0 or n == len(timeline):
+                self._emit("simulate", n, len(timeline), ts)
+                # 让出一次事件循环：撮合是纯 CPU 循环、没有任何 await 会挂起，
+                # 不让出的话 HTTP 进度端点在整场跑完前都得不到调度（前端轮询全部超时）
+                await asyncio.sleep(0)
             for code in codes_ok:
                 idx = ts_index[code].get(ts)
                 if idx is None:
@@ -173,7 +213,11 @@ class Validator:
                         self._close(code, names[code], bar, pos, risk, idx)
                         continue
                     ctx = BarContext(code, names[code], bars_map[code], idx, pos, st.params)
-                    sig = st.on_bar(ctx)
+                    try:
+                        sig = st.on_bar(ctx)
+                    except Exception as e:
+                        self._rule_error(code, "on_bar(卖出)", e)
+                        continue
                     if sig is None or sig.action != "sell":
                         continue
                     if cfg.exec_price == "next_open" or day <= pos.buy_ts[:10]:
@@ -183,7 +227,11 @@ class Validator:
 
                 # 2. 买入评估：有持仓也可买入（每笔独立），每根K线最多一笔
                 ctx = BarContext(code, names[code], bars_map[code], idx, None, st.params)
-                sig = st.on_bar(ctx)
+                try:
+                    sig = st.on_bar(ctx)
+                except Exception as e:
+                    self._rule_error(code, "on_bar(买入)", e)
+                    sig = None
                 if sig is not None and sig.action == "buy":
                     if cfg.exec_price == "next_open":
                         self.pending_buy[code] = sig
@@ -307,8 +355,12 @@ class Validator:
         pos = self.positions[code][-1]
         st = self.strategies.get(code)
         if st is not None:
-            st.on_position_opened(BarContext(code, name, self.bars_map.get(code) or [],
-                                             idx, pos, st.params), pos)
+            try:
+                st.on_position_opened(
+                    BarContext(code, name, self.bars_map.get(code) or [],
+                               idx, pos, st.params), pos)
+            except Exception as e:
+                self._rule_error(code, "on_position_opened", e)
 
     def _close(self, code: str, name: str, bar: dict, pos: VPosition, sig: Signal,
                idx: int) -> None:
@@ -335,8 +387,23 @@ class Validator:
             pos_list.remove(pos)
         st = self.strategies.get(code)
         if st is not None:
-            st.on_position_closed(BarContext(code, name, self.bars_map.get(code) or [],
-                                             idx, None, st.params), pos)
+            try:
+                st.on_position_closed(
+                    BarContext(code, name, self.bars_map.get(code) or [],
+                               idx, None, st.params), pos)
+            except Exception as e:
+                self._rule_error(code, "on_position_closed", e)
+
+    def _rule_error(self, code: str, phase: str, e: Exception) -> None:
+        """记录战法异常并继续。同一 (股票, 阶段, 异常类型) 只记一条——
+        事件循环有几十万次迭代，不去重会把 warnings 刷爆"""
+        key = (code, phase, type(e).__name__)
+        if key in self._rule_errors:
+            return
+        self._rule_errors.add(key)
+        self.warnings.append(
+            f"{code} 战法 {phase} 异常（已忽略，后续同类不再重复报告）："
+            f"{type(e).__name__}: {e}")
 
     # ------------------------- 买入质量 -------------------------
 
@@ -456,11 +523,14 @@ class Validator:
         }
 
 
-async def run_validator(cfg) -> dict:
-    """运行信号验证（cfg 为 ValidatorConfig 或 dict），自动释放数据源连接"""
+async def run_validator(cfg, on_progress=None) -> dict:
+    """运行信号验证（cfg 为 ValidatorConfig 或 dict），自动释放数据源连接
+
+    on_progress: 可选进度回调，收到 {type,phase,done,total,code,elapsed}
+    """
     if isinstance(cfg, dict):
         cfg = ValidatorConfig.from_dict(cfg)
-    v = Validator(cfg)
+    v = Validator(cfg, on_progress=on_progress)
     try:
         return await v.run()
     finally:
