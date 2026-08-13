@@ -37,6 +37,8 @@ class Scanner:
         # 早先 daily_cache/k60_cache 两个 dict 读的是同一张混存表，60m 序列被 1m 污染
         self.bars: Dict[str, Dict[str, List[dict]]] = {
             p: {} for p in config.REALTIME_PERIODS}
+        # (code, 策略key) -> 最近已上报的K线 ts，用于K线类策略"每根只报一次"
+        self._fired_bars: Dict[tuple, str] = {}
         self._running = False
         self._tasks: List[asyncio.Task] = []
         self.started_at = time.time()
@@ -253,10 +255,22 @@ class Scanner:
     # ------------------------------------------------------------------
 
     async def _emit_signal(self, ctx: strat.StockContext, hit: dict):
-        """信号去重 → 入库 → 广播"""
-        last_ts = self.store.last_signal_time(ctx.code, hit["key"])
-        if last_ts and time.time() - last_ts < config.SIGNAL_DEDUP_SECONDS:
-            return
+        """信号去重 → 入库 → 广播
+
+        K线类策略的命中带 bar_ts（判定所依据的已收盘K线），按"每根只报一次"去重：
+        收盘确认后同一根会被反复评估——日线那根能持续一整天——只靠 30 分钟时间窗
+        会把同一个信号反复上报。快照类没有 bar_ts，仍走时间窗
+        """
+        bar_ts = hit.get("bar_ts") or ""
+        if bar_ts:
+            dedup_key = (ctx.code, hit["key"])
+            if self._fired_bars.get(dedup_key) == bar_ts:
+                return
+            self._fired_bars[dedup_key] = bar_ts
+        else:
+            last_ts = self.store.last_signal_time(ctx.code, hit["key"])
+            if last_ts and time.time() - last_ts < config.SIGNAL_DEDUP_SECONDS:
+                return
         self.store.add_signal(
             ctx.code, ctx.name, hit["key"], hit["price"], hit["change_pct"], hit["reason"])
         await self._broadcast({

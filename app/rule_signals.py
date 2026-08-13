@@ -27,45 +27,17 @@ from typing import Dict, List, Optional, Tuple
 
 import config
 from app import strategies as strat
+from app.bars import last_closed_index
 
-# 日线/周线当日K线的收盘时刻（分钟数）：A股 15:00 收盘
-_DAILY_CLOSE_MINUTE = 15 * 60
 # 各周期"新鲜度"上限（分钟）：已收盘K线早于此值则不再触发，
 # 避免服务重启后对着昨天的收盘K线补报一批信号
 _FRESH_MINUTES = {"30m": 60, "60m": 120, "daily": 24 * 60}
 _FRESH_DEFAULT = 120
 
 
-def _now() -> datetime:
-    return datetime.now()
-
-
-def _is_closed(ts: str, now: Optional[datetime] = None) -> bool:
-    """该K线是否已收盘。ts 是K线结束时刻，故 ts <= 现在即已收盘
-
-    日线/周线的 ts 只有日期，当日那根要等到 15:00 之后才算最终
-    """
-    now = now or _now()
-    if len(ts) <= 10:
-        today = now.strftime("%Y-%m-%d")
-        if ts[:10] < today:
-            return True
-        return now.hour * 60 + now.minute >= _DAILY_CLOSE_MINUTE
-    return ts <= now.strftime("%Y-%m-%d %H:%M")
-
-
-def last_closed_index(bars: List[dict], now: Optional[datetime] = None) -> Optional[int]:
-    """最后一根已收盘K线的下标；没有则 None。从末尾往前找，通常一步就命中"""
-    now = now or _now()
-    for i in range(len(bars) - 1, -1, -1):
-        if _is_closed(bars[i]["ts"], now):
-            return i
-    return None
-
-
 def _age_minutes(ts: str, now: Optional[datetime] = None) -> float:
     """该K线结束时刻距今多少分钟（解析失败返回 0，按"新鲜"处理，不误杀）"""
-    now = now or _now()
+    now = now or datetime.now()
     try:
         if len(ts) <= 10:
             end = datetime.strptime(ts[:10], "%Y-%m-%d")

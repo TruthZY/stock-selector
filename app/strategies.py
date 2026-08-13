@@ -6,6 +6,7 @@ from typing import Callable, Dict, List, Optional
 
 import config
 from app import indicators as ta
+from app.bars import closed_slice
 
 # 涨跌幅阈值：主板 10%，创业板/科创板 20%
 def _limit_pct(code: str) -> float:
@@ -33,8 +34,8 @@ class StockContext:
 # ---------------------------------------------------------------------------
 
 def _ma_bull(ctx: StockContext, params: Dict) -> tuple:
-    """日K均线多头排列：MA5>MA10>MA20>MA60，且收于MA5上方"""
-    daily = ctx.daily
+    """日K均线多头排列：MA5>MA10>MA20>MA60，且收于MA5上方（以最新已收盘日K为准）"""
+    daily = closed_slice(ctx.daily)
     if len(daily) < 60:
         return False, "日K数据不足"
     closes = [k["close"] for k in daily]
@@ -46,18 +47,18 @@ def _ma_bull(ctx: StockContext, params: Dict) -> tuple:
     ok = ma5[-1] > ma10[-1] > ma20[-1] > ma60[-1] > 0 and last["close"] > ma5[-1]
     if ok:
         return True, (f"MA5({ma5[-1]:.2f})>MA10({ma10[-1]:.2f})>MA20({ma20[-1]:.2f})"
-                      f">MA60({ma60[-1]:.2f})")
+                      f">MA60({ma60[-1]:.2f}) @ {last['ts']}"), last["ts"]
     return False, ""
 
 
 def _ma_golden_cross(ctx: StockContext, params: Dict) -> tuple:
-    """日K MA5 上穿 MA10（最新一根K线发生）"""
-    daily = ctx.daily
+    """日K MA5 上穿 MA10（以最新已收盘日K为准）"""
+    daily = closed_slice(ctx.daily)
     if len(daily) < 12:
         return False, "日K数据不足"
     closes = [k["close"] for k in daily]
     if ta.cross_up(ta.ma(closes, 5), ta.ma(closes, 10)):
-        return True, f"MA5上穿MA10 @ {daily[-1]['ts']}"
+        return True, f"MA5上穿MA10 @ {daily[-1]['ts']}", daily[-1]["ts"]
     return False, ""
 
 
@@ -67,13 +68,14 @@ def _macd_golden(ctx: StockContext, params: Dict) -> tuple:
     此前写死取 ctx.k60，config 里那个 {"period": "60m"} 从来没被读过
     """
     period = str(params.get("period") or "60m")
-    bars = (ctx.bars or {}).get(period) or (ctx.k60 if period == "60m" else [])
+    bars = closed_slice((ctx.bars or {}).get(period)
+                        or (ctx.k60 if period == "60m" else []))
     if len(bars) < 35:
         return False, f"{period} K线数据不足"
     closes = [k["close"] for k in bars]
     dif, dea, _ = ta.macd(closes)
     if ta.cross_up(dif, dea):
-        return True, f"{period} DIF上穿DEA @ {bars[-1]['ts']}"
+        return True, f"{period} DIF上穿DEA @ {bars[-1]['ts']}", bars[-1]["ts"]
     return False, ""
 
 
@@ -209,14 +211,20 @@ class StrategyEngine:
                 continue
             try:
                 # 只把该策略自己那一层参数传进去（扁平），实现里读 params.get("xxx")
-                matched, reason = STRATEGY_IMPL[key](ctx, self.params.get(key, {}))
+                res = STRATEGY_IMPL[key](ctx, self.params.get(key, {}))
             except Exception:
                 continue
+            # 实现可返回 (命中, 原因) 或 (命中, 原因, 判定所依据的K线ts)。
+            # 带 ts 的（K线类策略）由 Scanner 按"每根只报一次"去重——收盘确认后
+            # 同一根已收盘K线会被反复评估，只靠时间窗去重会重复上报
+            matched, reason = res[0], res[1]
+            bar_ts = res[2] if len(res) > 2 else ""
             if matched:
                 hits.append({
                     "key": key,
                     "name": meta["name"],
                     "reason": reason,
+                    "bar_ts": bar_ts,
                     "price": (ctx.snap or {}).get("price", 0.0),
                     "change_pct": (ctx.snap or {}).get("change_pct", 0.0),
                 })
