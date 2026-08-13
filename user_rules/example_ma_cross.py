@@ -38,6 +38,19 @@ ctx 提供：ctx.bar() 当前K线、ctx.prev(n) 前n根、ctx.closes()/highs()/l
 
 声明 default_params + PARAM_LABELS 后，验证台会自动生成参数表单。
 再声明 PARAM_META 还能得到下拉/多选/时间控件，见 app/backtest/rules.py 里的例子。
+
+可选：在买入规则类上声明 REALTIME_SIGNAL，就能把这个战法接入实时盘——
+改完跑 reload_rules.bat 即生效，不用改 config.py 重启服务：
+
+    REALTIME_SIGNAL = {
+        "period": "30m",               # 必须：30m/60m/daily 之一（config.REALTIME_PERIODS）
+        "confirm_on_close": True,       # True=买入战法（收盘确认，报了不撤）
+                                        # False=盘中异动（判定进行中K线，即时会撤）
+        # 可选：key（信号名，默认=规则key）、params（覆盖默认参数）、
+        #       interval（盘中异动每只股票求值间隔秒，默认30）、enabled（默认True）
+    }
+
+卖出规则不能声明 REALTIME_SIGNAL（实时侧没有持仓概念）。
 """
 from typing import Optional
 

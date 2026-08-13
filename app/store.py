@@ -46,6 +46,18 @@ CREATE TABLE IF NOT EXISTS watch (
     name TEXT NOT NULL,
     added_at TEXT DEFAULT ''
 );
+CREATE TABLE IF NOT EXISTS custom_groups (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    name       TEXT NOT NULL UNIQUE,
+    created_at TEXT DEFAULT ''
+);
+CREATE TABLE IF NOT EXISTS custom_group_stocks (
+    group_id INTEGER NOT NULL,
+    code     TEXT NOT NULL,
+    name     TEXT NOT NULL,
+    added_at TEXT DEFAULT '',
+    PRIMARY KEY (group_id, code)
+);
 """
 
 
@@ -60,6 +72,7 @@ class Store:
             conn.executescript(_SCHEMA)
             conn.commit()
             self._migrate(conn)
+            self._migrate_custom(conn)
         finally:
             conn.close()
 
@@ -198,6 +211,139 @@ class Store:
             try:
                 conn.execute("DELETE FROM watch WHERE code=?", (code,))
                 conn.commit()
+            finally:
+                conn.close()
+
+    # ------------------------- 自定义分组 -------------------------
+    # 用户自建的股票分组（可增删改名），供战法筛选面板作为扫描范围。
+    # 组内股票参与 Scanner 的行情轮询（见 _monitored_codes），但不评估策略信号
+
+    def _migrate_custom(self, conn: sqlite3.Connection) -> None:
+        """把早期单表 custom 的数据迁进分组结构（若存在旧表且有数据）"""
+        has = {r[0] for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'")}
+        if "custom" not in has:
+            return
+        rows = conn.execute(
+            "SELECT code,name,added_at FROM custom ORDER BY added_at").fetchall()
+        if rows:
+            cur = conn.execute(
+                "INSERT INTO custom_groups(name,created_at) VALUES(?,?)",
+                ("自定义", time.strftime("%Y-%m-%d %H:%M:%S")))
+            conn.executemany(
+                "INSERT OR IGNORE INTO custom_group_stocks"
+                "(group_id,code,name,added_at) VALUES(?,?,?,?)",
+                [(cur.lastrowid, r[0], r[1], r[2] or "") for r in rows])
+        conn.execute("DROP TABLE custom")
+        conn.commit()
+
+    def get_groups(self) -> List[dict]:
+        """全部分组及组内股票：[{id, name, stocks:[{code,name}]}]（按创建顺序）"""
+        with self._lock:
+            conn = self._connect()
+            try:
+                groups = [{"id": r[0], "name": r[1], "stocks": []}
+                          for r in conn.execute(
+                              "SELECT id,name FROM custom_groups ORDER BY id")]
+                rows = conn.execute(
+                    "SELECT group_id,code,name FROM custom_group_stocks "
+                    "ORDER BY added_at, code").fetchall()
+            finally:
+                conn.close()
+        for gid, code, name in rows:
+            g = next((x for x in groups if x["id"] == gid), None)
+            if g:
+                g["stocks"].append({"code": code, "name": name})
+        return groups
+
+    def add_group(self, name: str) -> dict:
+        with self._lock:
+            conn = self._connect()
+            try:
+                try:
+                    cur = conn.execute(
+                        "INSERT INTO custom_groups(name,created_at) VALUES(?,?)",
+                        (name, time.strftime("%Y-%m-%d %H:%M:%S")))
+                    conn.commit()
+                except sqlite3.IntegrityError:
+                    return {"ok": False, "msg": f"组「{name}」已存在"}
+                return {"ok": True, "msg": f"已新建组：{name}", "id": cur.lastrowid}
+            finally:
+                conn.close()
+
+    def rename_group(self, gid: int, name: str) -> dict:
+        with self._lock:
+            conn = self._connect()
+            try:
+                try:
+                    cur = conn.execute(
+                        "UPDATE custom_groups SET name=? WHERE id=?", (name, gid))
+                    conn.commit()
+                except sqlite3.IntegrityError:
+                    return {"ok": False, "msg": f"组「{name}」已存在"}
+                if cur.rowcount == 0:
+                    return {"ok": False, "msg": "组不存在（可能已被删除）"}
+            finally:
+                conn.close()
+        return {"ok": True, "msg": f"已改名为：{name}"}
+
+    def remove_group(self, gid: int) -> dict:
+        with self._lock:
+            conn = self._connect()
+            try:
+                conn.execute("DELETE FROM custom_group_stocks WHERE group_id=?", (gid,))
+                conn.execute("DELETE FROM custom_groups WHERE id=?", (gid,))
+                conn.commit()
+            finally:
+                conn.close()
+        return {"ok": True, "msg": "组已删除"}
+
+    def add_group_stock(self, gid: int, code: str, name: str) -> dict:
+        with self._lock:
+            conn = self._connect()
+            try:
+                row = conn.execute("SELECT name FROM custom_groups WHERE id=?",
+                                   (gid,)).fetchone()
+                if not row:
+                    return {"ok": False, "msg": "组不存在（可能已被删除）"}
+                conn.execute(
+                    "INSERT OR REPLACE INTO custom_group_stocks"
+                    "(group_id,code,name,added_at) VALUES(?,?,?,?)",
+                    (gid, code, name, time.strftime("%Y-%m-%d %H:%M:%S")))
+                conn.commit()
+            finally:
+                conn.close()
+        return {"ok": True, "msg": f"已加入 {name} {code}"}
+
+    def remove_group_stock(self, gid: int, code: str) -> dict:
+        with self._lock:
+            conn = self._connect()
+            try:
+                conn.execute(
+                    "DELETE FROM custom_group_stocks WHERE group_id=? AND code=?",
+                    (gid, code))
+                conn.commit()
+            finally:
+                conn.close()
+        return {"ok": True, "msg": f"已移出 {code}"}
+
+    def get_group_stocks(self, gid: int) -> List[Tuple[str, str]]:
+        with self._lock:
+            conn = self._connect()
+            try:
+                return conn.execute(
+                    "SELECT code,name FROM custom_group_stocks WHERE group_id=? "
+                    "ORDER BY added_at, code", (gid,)).fetchall()
+            finally:
+                conn.close()
+
+    def get_all_group_stocks(self) -> List[Tuple[str, str]]:
+        """全部组内股票（去重），供行情轮询"""
+        with self._lock:
+            conn = self._connect()
+            try:
+                return conn.execute(
+                    "SELECT DISTINCT code,name FROM custom_group_stocks").fetchall()
             finally:
                 conn.close()
 

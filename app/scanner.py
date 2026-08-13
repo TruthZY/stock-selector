@@ -117,10 +117,14 @@ class Scanner:
     # ------------------------------------------------------------------
 
     def _monitored_codes(self) -> List[str]:
-        """监控目标 = 股票池 + 自选股（自选股只参与行情轮询，不评估策略）"""
+        """监控目标 = 股票池 + 自选 + 全部自定义组内股票（后两者只参与行情轮询，不评估策略）"""
         codes = [c for c, _ in self.store.get_stocks()]
-        pool = set(codes)
-        codes += [c for c, _ in self.store.get_watch() if c not in pool]
+        seen = set(codes)
+        for extra in (self.store.get_watch(), self.store.get_all_group_stocks()):
+            for c, _ in extra:
+                if c not in seen:
+                    seen.add(c)
+                    codes.append(c)
         return codes
 
     # ------------------------------------------------------------------

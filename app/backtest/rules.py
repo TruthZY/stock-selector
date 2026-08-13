@@ -50,6 +50,22 @@ class BuyRule(ABC):
     PARAM_LABELS: Dict[str, str] = {}
     PARAM_META: Dict[str, dict] = {}
 
+    # 实时信号声明：想在实时盘上跑就把这行写出来（留空 dict = 不接入实时）。
+    # 声明随规则一起被 app/rule_signals.register_rule_signals 收集——内置规则
+    # 服务启动时生效，user_rules/ 里的自定义规则随 reload_rules.bat 热加载
+    # 生效，无需再改 config.py 重启服务。
+    #   key      实时信号 key，必须唯一；省略时默认用规则 key
+    #   period   周期，必须是 config.REALTIME_PERIODS 里的周期
+    #   confirm_on_close  True=买入战法（判定最后一根已收盘K线，报了不撤）
+    #                     False=盘中异动（判定末根进行中K线，即时、会撤）
+    #   interval  仅盘中异动生效：每只股票最多每 N 秒求值一次（默认 30）
+    #   params    覆盖规则默认参数（扁平，与验证台参数面板一致）
+    #   enabled   默认是否启用
+    #   name/desc/fresh_only  可选，缺省用规则自身的 name/desc
+    #
+    # 例：REALTIME_SIGNAL = {"period": "30m", "confirm_on_close": True}
+    REALTIME_SIGNAL: Dict = {}
+
     def __init__(self):
         self.params: Dict = dict(self.default_params or {})
 
@@ -163,6 +179,10 @@ class KdjRsiGoldenBuy(BuyRule):
     name = "KDJ+RSI双金叉共振"
     desc = ("近N根内KDJ与RSI双金叉，买入时间窗[after,before]内，趋势上涨回调/横盘/"
             "下落企稳，阳包阴>阴包阳；低位/量能/涨幅过滤")
+    REALTIME_SIGNAL = {
+        "key": "rt_kdj_rsi_30m", "period": "30m",
+        "confirm_on_close": True, "params": {}, "enabled": True,
+    }
     default_params = {
         "buy_amount": 10000.0,      # 每笔固定买入金额（元）
         "kdj_n": 9,                 # KDJ 周期
@@ -421,6 +441,10 @@ class VolumeBreakoutBuy(BuyRule):
     key = "volume_breakout"
     name = "放量突破"
     desc = "量比≥阈值 且 收盘突破前N根最高（量比=当根量/前5根均量）"
+    REALTIME_SIGNAL = {
+        "key": "volume_breakout", "period": "daily",
+        "confirm_on_close": False, "params": {}, "enabled": True,
+    }
     default_params = {"buy_amount": 10000.0, "volume_ratio": 2.0, "break_days": 20}
     PARAM_LABELS = {"buy_amount": "每笔买入金额(元)", "volume_ratio": "量比阈值",
                     "break_days": "突破回看根数"}
@@ -451,6 +475,10 @@ class RsiOversoldBuy(BuyRule):
     key = "rsi_oversold"
     name = "RSI超卖反弹"
     desc = "RSI低于阈值 且 当根收盘高于上一根（超卖后转涨）"
+    REALTIME_SIGNAL = {
+        "key": "rsi_oversold", "period": "daily",
+        "confirm_on_close": False, "params": {}, "enabled": True,
+    }
     default_params = {"buy_amount": 10000.0, "rsi_n": 14, "rsi_below": 30.0}
     PARAM_LABELS = {"buy_amount": "每笔买入金额(元)", "rsi_n": "RSI周期",
                     "rsi_below": "RSI上限"}
@@ -482,6 +510,10 @@ class StrongUpBuy(BuyRule):
     key = "strong_up"
     name = "强势拉升"
     desc = "涨幅≥阈值 且 非一字板（四价相等视为一字板，无法买入）"
+    REALTIME_SIGNAL = {
+        "key": "strong_up", "period": "daily",
+        "confirm_on_close": False, "params": {}, "enabled": True,
+    }
     default_params = {"buy_amount": 10000.0, "pct": 5.0}
     PARAM_LABELS = {"buy_amount": "每笔买入金额(元)", "pct": "涨幅阈值%"}
 
@@ -503,6 +535,10 @@ class LimitUpBuy(BuyRule):
     key = "limit_up"
     name = "涨停预警"
     desc = "涨幅达涨停幅度的99%以上；幅度按代码前缀推（创业板/科创板20%，其余10%）"
+    REALTIME_SIGNAL = {
+        "key": "limit_up", "period": "daily",
+        "confirm_on_close": False, "interval": 3, "params": {}, "enabled": True,
+    }
     default_params = {"buy_amount": 10000.0, "limit_pct": 0.0}
     PARAM_LABELS = {"buy_amount": "每笔买入金额(元)",
                     "limit_pct": "涨停幅度%(0=按代码自动)"}

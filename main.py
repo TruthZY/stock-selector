@@ -5,6 +5,7 @@ import json
 import os
 import time
 from contextlib import asynccontextmanager
+from typing import Optional
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse
@@ -309,6 +310,55 @@ async def remove_watch(code: str):
     return {"ok": True, "msg": f"已移出自选：{code}"}
 
 
+@app.get("/api/custom/groups")
+async def custom_groups():
+    return {"groups": store.get_groups()}
+
+
+@app.post("/api/custom/groups")
+async def add_custom_group(req: dict):
+    name = str(req.get("name", "")).strip()
+    if not name:
+        return {"ok": False, "msg": "请输入组名"}
+    if len(name) > 20:
+        return {"ok": False, "msg": "组名过长（最多20字）"}
+    return store.add_group(name)
+
+
+@app.post("/api/custom/groups/{gid}/rename")
+async def rename_custom_group(gid: int, req: dict):
+    name = str(req.get("name", "")).strip()
+    if not name:
+        return {"ok": False, "msg": "请输入组名"}
+    if len(name) > 20:
+        return {"ok": False, "msg": "组名过长（最多20字）"}
+    return store.rename_group(gid, name)
+
+
+@app.delete("/api/custom/groups/{gid}")
+async def remove_custom_group(gid: int):
+    return store.remove_group(gid)
+
+
+@app.post("/api/custom/groups/{gid}/stocks")
+async def add_custom_group_stock(gid: int, req: dict):
+    q = str(req.get("code", "")).strip()
+    if not q:
+        return {"ok": False, "msg": "请输入股票代码或名称"}
+    code = await resolve_code(q)
+    if not code:
+        return {"ok": False, "msg": f"未找到“{q}”，请检查代码或名称"}
+    snap = (await ds.snapshots([code])).get(code)
+    if not snap:
+        return {"ok": False, "msg": f"代码 {code} 行情获取失败，请确认是有效的A股代码"}
+    return store.add_group_stock(gid, code, snap.get("name") or code)
+
+
+@app.delete("/api/custom/groups/{gid}/stocks/{code}")
+async def remove_custom_group_stock(gid: int, code: str):
+    return store.remove_group_stock(gid, code)
+
+
 @app.get("/api/kline")
 async def kline(code: str, period: str = "daily", limit: int = 250):
     """K线图数据：日线读本地库，分钟周期按需实时拉取（20秒进程内缓存）
@@ -419,6 +469,22 @@ async def scan_pattern(pattern: str, period: str = "30m", window: int = 5,
     result["elapsed_ms"] = int((time.time() - start) * 1000)
     scan_cache[cache_key] = (now, result)
     return result
+
+
+@app.get("/api/scan-rules")
+async def scan_rules(rule: str, period: str = "30m", scope: str = "pool",
+                     day: str = "today", mode: str = "live",
+                     group_id: Optional[int] = None):
+    """战法筛选：把买入规则应用到指定交易日的K线上，选出触发规则的股票
+
+    mode: live=盘中异动（判定该日末根，含进行中）/ close=买入战法（判定该日
+    最后一根已收盘K线，与回测逐根一致）。范围：pool=股票池 / watch=自选 /
+    group=自定义分组（需 group_id）。命中判定与实时信号同一套规则代码
+    """
+    from app.rule_scan import run_rule_scan
+    return await run_rule_scan(rule=rule, period=period, scope=scope, day=day,
+                               mode=mode, store=store, ds=ds, scanner=scanner,
+                               group_id=group_id)
 
 
 @app.get("/api/strategies")

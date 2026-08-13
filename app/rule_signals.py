@@ -229,7 +229,12 @@ REGISTERED: Dict[str, RuleSignal] = {}
 
 
 def register_rule_signals(engine) -> dict:
-    """把 config.REALTIME_RULE_SIGNALS 注册进实时策略引擎，返回注册报告
+    """把实时信号声明注册进实时策略引擎，返回注册报告
+
+    声明来自两个来源（合并后去重）：
+      1. config.REALTIME_RULE_SIGNALS 列表（补充入口，重启才生效）
+      2. 各买入规则的 REALTIME_SIGNAL 类属性（战法内声明）——内置规则启动时
+         生效，user_rules/ 里的自定义规则随 reload_rules.bat 热加载生效
 
     要三处协同才生效，少一处就静默失效：
       STRATEGY_IMPL[key]        求值函数
@@ -253,7 +258,19 @@ def register_rule_signals(engine) -> dict:
         strat.SNAPSHOT_STRATEGIES.discard(key)
         engine.strategies.pop(key, None)
 
-    for spec in (config.REALTIME_RULE_SIGNALS or []):
+    # 收集声明：config 列表 + 规则类属性。规则类声明省略 key/rule 时
+    # 默认用规则自身的 key，这样自定义战法只需写 period/confirm_on_close
+    specs = [(dict(s), str(s.get("rule") or "")) for s in (config.REALTIME_RULE_SIGNALS or [])]
+    for rule_key in sorted(BUY_REGISTRY):
+        decl = getattr(BUY_REGISTRY[rule_key], "REALTIME_SIGNAL", None) or {}
+        if not decl:
+            continue
+        spec = dict(decl)
+        spec.setdefault("key", rule_key)
+        spec["rule"] = str(spec.get("rule") or rule_key)
+        specs.append((spec, rule_key))
+
+    for spec, _declared_by in specs:
         key = str(spec.get("key") or "").strip()
         rule_key = str(spec.get("rule") or "").strip()
         period = str(spec.get("period") or "").strip()

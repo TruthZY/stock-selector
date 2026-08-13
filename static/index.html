@@ -162,6 +162,51 @@
   .sig .code { color: var(--accent); cursor: pointer; }
   .sig .strat { color: #d2a8ff; }
   .sig .reason { color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  /* 信号筛选栏：按策略显隐实时信号（买入战法 / 盘中异动分组） */
+  .signal-filter-bar {
+    display: flex; align-items: center; gap: 4px; flex-wrap: wrap;
+    padding: 4px 12px; border-bottom: 1px solid var(--border);
+  }
+  .sig-filter-group { display: inline-flex; align-items: center; gap: 4px; margin-right: 10px; }
+  .sig-filter-label {
+    font-size: 11px; color: var(--muted); opacity: .75; cursor: pointer;
+    border-right: 1px solid var(--border); padding-right: 6px; user-select: none;
+  }
+  .sig-filter-label:hover { color: var(--text); }
+  .sig-chip {
+    padding: 1px 8px; border-radius: 10px; cursor: pointer; user-select: none;
+    border: 1px solid var(--border); color: var(--muted); background: transparent;
+    font-size: 11px; transition: all .15s;
+  }
+  .sig-chip.on { color: #7ee787; border-color: #7ee787; background: rgba(126,231,135,.12); }
+  .sig-chip.k-alert.on { color: #d29922; border-color: #d29922; background: rgba(210,153,34,.12); }
+  /* 右键菜单（股票→加入组 / 组→改名删除） */
+  .ctx-menu {
+    position: fixed; z-index: 200; display: none; min-width: 140px;
+    background: var(--panel); border: 1px solid var(--border); border-radius: 6px;
+    box-shadow: 0 4px 12px rgba(0,0,0,.5); padding: 4px 0;
+  }
+  .ctx-item { padding: 6px 14px; font-size: 12px; cursor: pointer; white-space: nowrap; }
+  .ctx-item:hover { background: #1c2330; }
+  .ctx-sep { height: 1px; background: var(--border); margin: 3px 0; }
+  /* 内联弹窗（建组/改名/删除确认）：替代 prompt/confirm，沙盒 iframe 里原生弹窗会被禁用 */
+  .modal-mask {
+    position: fixed; inset: 0; z-index: 300; display: none;
+    align-items: center; justify-content: center; background: rgba(0,0,0,.45);
+  }
+  .modal {
+    background: var(--panel); border: 1px solid var(--border); border-radius: 8px;
+    padding: 16px; width: 320px; box-shadow: 0 8px 24px rgba(0,0,0,.5);
+  }
+  .modal-title { font-size: 14px; margin-bottom: 10px; }
+  .modal-input {
+    width: 100%; padding: 6px 8px; margin-bottom: 10px; border-radius: 6px;
+    border: 1px solid var(--border); background: var(--bg); color: var(--text); outline: none;
+  }
+  .modal-input:focus { border-color: var(--accent); }
+  .modal-msg { font-size: 12px; color: var(--muted); margin-bottom: 10px; white-space: pre-line; }
+  .modal-btns { display: flex; gap: 8px; justify-content: flex-end; }
+  .modal-btns button.ok { background: rgba(88,166,255,.15); border-color: var(--accent); color: var(--accent); }
   .empty { color: var(--muted); text-align: center; padding: 40px 0; }
   ::-webkit-scrollbar { width: 8px; height: 8px; }
   ::-webkit-scrollbar-thumb { background: #30363d; border-radius: 4px; }
@@ -191,9 +236,10 @@
 </header>
 <main>
   <aside>
-    <div class="aside-tabs">
+    <div class="aside-tabs" id="asideTabs">
       <span class="aside-tab on" id="tabAll" onclick="setView('all')">📊 股票池<span id="poolCount"></span></span>
       <span class="aside-tab" id="tabWatch" onclick="setView('watch')">★ 自选<span id="watchCount"></span></span>
+      <span class="aside-tab" id="tabAddGroup" onclick="promptAddGroup()" title="新建自定义组（右键股票可加入组）">＋</span>
     </div>
     <div class="table-wrap">
       <table>
@@ -226,14 +272,19 @@
     <div class="signals-panel">
       <div class="panel-tabs">
         <span class="panel-tab on" id="tabSignals" onclick="switchPanel('signals')">🛎 实时信号</span>
-        <span class="panel-tab" id="tabScan" onclick="switchPanel('scan')">🔍 形态筛选</span>
+        <span class="panel-tab" id="tabScan" onclick="switchPanel('scan')">🔍 战法筛选</span>
       </div>
       <div id="signalPanel" style="flex:1;display:flex;flex-direction:column;min-height:0">
+        <div id="signalFilterBar" class="signal-filter-bar"></div>
         <div id="signalList"></div>
       </div>
       <div id="scanPanel" style="display:none;flex:1;flex-direction:column;min-height:0">
         <div class="scan-bar">
-          <select id="scanPattern"></select>
+          <select id="scanRule" title="买入规则（含 user_rules 自定义战法）"></select>
+          <select id="scanMode" title="盘中异动=判定当日末根（进行中，即时会撤）；买入战法=判定当日最后一根已收盘K线（与回测逐根一致）">
+            <option value="live" selected>盘中异动</option>
+            <option value="close">买入战法</option>
+          </select>
           <select id="scanPeriod">
             <option value="30m" selected>30分</option>
             <option value="60m">60分</option>
@@ -241,25 +292,14 @@
             <option value="5m">5分</option>
             <option value="daily">日K</option>
           </select>
-          <select id="scanWindow">
-            <option value="3">最后3根</option>
-            <option value="5" selected>最后5根</option>
-            <option value="8">最后8根</option>
-          </select>
           <select id="scanDay">
-            <option value="latest" selected>最近交易日</option>
-            <option value="today">仅今天</option>
+            <option value="today" selected>今天</option>
+            <option value="latest">最近交易日</option>
             <option value="prev">前一天</option>
           </select>
-          <select id="scanScope">
+          <select id="scanScope" title="扫描范围：股票池/自选/自定义分组">
             <option value="pool" selected>股票池</option>
-            <option value="all">全市场</option>
-          </select>
-          <select id="scanTrend" onchange="applyTrendFilter()" title="按形态出现前5根K线的趋势过滤">
-            <option value="all" selected>任意趋势</option>
-            <option value="up">↑ 上升</option>
-            <option value="down">↓ 下降</option>
-            <option value="flat">→ 平稳</option>
+            <option value="watch">自选</option>
           </select>
           <button onclick="runScan()">查询</button>
           <span id="scanMsg" class="muted"></span>
@@ -269,6 +309,18 @@
     </div>
   </section>
 </main>
+<div id="ctxMenu" class="ctx-menu"></div>
+<div id="modalMask" class="modal-mask">
+  <div class="modal">
+    <div class="modal-title" id="modalTitle"></div>
+    <input id="modalInput" class="modal-input" style="display:none" />
+    <div class="modal-msg" id="modalMsg"></div>
+    <div class="modal-btns">
+      <button id="modalCancel">取消</button>
+      <button id="modalOk" class="ok">确定</button>
+    </div>
+  </div>
+</div>
 
 <script>
 // ---------------------------------------------------------------------------
@@ -304,10 +356,74 @@ let chartKey = null;
 let sortedKey = "change_pct", sortedDir = -1;
 let stratDefs = {};        // key -> {name, enabled}
 let watchSet = new Set();  // 自选股代码集合
-let viewMode = "all";      // all=股票池 watch=仅自选
-let lastScanData = null;   // 最近一次形态扫描结果（供趋势过滤本地重筛）
+let customGroups = [];     // 自定义分组 [{id, name, stocks:[{code,name}]}]
+let viewMode = "all";      // all=股票池 watch=仅自选 group:{id}=某自定义组
+let signalFilter = {};     // 信号筛选：key -> 是否显示（缺省=显示）
+let lastScanData = null;   // 最近一次扫描结果（供筛选面板本地重筛）
 
 const $ = id => document.getElementById(id);
+
+// ---------------------------------------------------------------------------
+// 信号筛选（信号面板顶部：按策略显隐实时信号，默认全部显示）
+// ---------------------------------------------------------------------------
+function buildSignalFilters(strats) {
+  const bar = $("signalFilterBar");
+  const old = signalFilter;
+  signalFilter = {};    // 重建：新策略默认显示，旧的选中状态保留
+  strats.forEach(s => { signalFilter[s.key] = old[s.key] !== false; });
+  bar.innerHTML = "";
+  const groups = [
+    { kind: "buy", label: "买入战法" },
+    { kind: "alert", label: "盘中异动" },
+  ];
+  groups.forEach(g => {
+    const items = strats.filter(s => (s.kind || "buy") === g.kind);
+    if (!items.length) return;
+    const wrap = document.createElement("span");
+    wrap.className = "sig-filter-group";
+    const lab = document.createElement("span");
+    lab.className = "sig-filter-label";
+    lab.textContent = g.label;
+    lab.title = "点击：整组信号显示/隐藏";
+    lab.onclick = () => toggleSignalGroup(g.kind);
+    wrap.appendChild(lab);
+    items.forEach(s => {
+      const chip = document.createElement("span");
+      const cls = () => "sig-chip k-" + g.kind + (signalFilter[s.key] ? " on" : "");
+      chip.className = cls();
+      chip.textContent = s.name + (g.kind === "buy" && s.period
+        ? " " + (PERIOD_LABEL[s.period] || s.period) : "");
+      chip.title = "点击：只显示/隐藏该策略的实时信号（不影响策略开关）";
+      chip.onclick = () => {
+        signalFilter[s.key] = !signalFilter[s.key];
+        chip.className = cls();
+        applySignalFilter();
+      };
+      wrap.appendChild(chip);
+    });
+    bar.appendChild(wrap);
+  });
+  if (!strats.length) bar.innerHTML = "";
+}
+
+function toggleSignalGroup(kind) {
+  // 整组反转：全部可见 → 全部隐藏，否则 → 全部显示
+  const keys = Object.keys(stratDefs).filter(k => stratDefs[k].kind === kind);
+  const allOn = keys.every(k => signalFilter[k] !== false);
+  keys.forEach(k => { signalFilter[k] = !allOn; });
+  buildSignalFilters(Object.values(stratDefs));   // 重建样式；顺序保持
+  applySignalFilter();
+}
+
+function applySignalFilter() {
+  // 已显示的信号条目按筛选显隐；表格 badge 与图表标记同步
+  [...$("signalList").children].forEach(el => {
+    const k = el.dataset.strategy;
+    el.style.display = signalFilter[k] === false ? "none" : "";
+  });
+  renderTable();
+  if (lastKlines.length) renderChart(lastKlines, currentSigs);
+}
 
 // ---------------------------------------------------------------------------
 // WebSocket
@@ -355,7 +471,7 @@ function handleMsg(msg) {
       break;
     case "status":
       if (d.msg) $("statusMsg").textContent = d.msg;
-      if (d.strategies) buildStratBar(d.strategies);
+      if (d.strategies) { buildStratBar(d.strategies); buildSignalFilters(d.strategies); }
       if (d.pool_size) $("poolCount").textContent = `(${d.pool_size})`;
       $("tradingText").textContent = d.trading ? "盘中" : "休市/盘外";
       break;
@@ -416,7 +532,13 @@ function buildStratBar(strats) {
 function renderTable() {
   const body = $("stockBody");
   let list = Object.values(snapshots);
+  let currentGroup = viewMode.startsWith("group:")
+    ? customGroups.find(g => "group:" + g.id === viewMode) : null;
   if (viewMode === "watch") list = list.filter(s => watchSet.has(s.code));
+  else if (currentGroup) {
+    const codes = new Set(currentGroup.stocks.map(s => s.code));
+    list = list.filter(s => codes.has(s.code));
+  }
   list.sort((a, b) => {
     let va = a[sortedKey], vb = b[sortedKey];
     if (va == null) va = -1e9; if (vb == null) vb = -1e9;
@@ -424,8 +546,12 @@ function renderTable() {
   });
   body.innerHTML = "";
   if (!list.length) {
-    body.innerHTML = `<tr><td colspan="7" class="empty">${viewMode === "watch"
-      ? "暂无自选股：在顶部输入代码，点“☆ 加自选”添加" : "暂无数据"}</td></tr>`;
+    const hint = viewMode === "watch"
+      ? "暂无自选股：在顶部输入代码，点“☆ 加自选”添加"
+      : currentGroup
+        ? `「${currentGroup.name}」暂无股票：在任意股票上点右键 → 选择本组加入`
+        : "暂无数据";
+    body.innerHTML = `<tr><td colspan="7" class="empty">${hint}</td></tr>`;
     return;
   }
   list.forEach(s => {
@@ -435,16 +561,27 @@ function renderTable() {
     const cls = pct > 0 ? "up" : pct < 0 ? "down" : "flat";
     const watched = watchSet.has(s.code);
     const badges = Object.entries(signalMap[s.code] || {})
+      .filter(([k]) => signalFilter[k] !== false)   // 信号筛选：隐藏的策略不出 badge
       .map(([k, v]) => `<span class="badge ${KIND_BADGE[stratKind(k)] || 'b-ma'}">${v.name}</span>`).join("");
+    const first = currentGroup
+      ? `<td style="text-align:center" class="star" title="移出「${currentGroup.name}」">✕</td>`
+      : `<td style="text-align:center" class="star${watched ? ' on' : ''}" title="${watched ? '移出自选' : '加入自选'}">${watched ? '★' : '☆'}</td>`;
     tr.innerHTML =
-      `<td style="text-align:center" class="star${watched ? ' on' : ''}" title="${watched ? '移出自选' : '加入自选'}">${watched ? '★' : '☆'}</td>` +
+      first +
       `<td>${s.code}</td><td>${s.name}</td>` +
       `<td class="${cls}">${fmt(s.price, 2)}</td>` +
       `<td class="${cls}">${pct > 0 ? '+' : ''}${pct.toFixed(2)}%</td>` +
       `<td>${fmt(s.volume_ratio, 2)}</td>` +
       `<td style="text-align:left">${badges}</td>`;
-    tr.cells[0].onclick = e => { e.stopPropagation(); toggleWatch(s.code); };
+    tr.cells[0].onclick = e => {
+      e.stopPropagation();
+      currentGroup ? removeGroupStock(currentGroup.id, s.code) : toggleWatch(s.code);
+    };
     tr.onclick = () => selectStock(s.code);
+    tr.oncontextmenu = ev => {
+      ev.preventDefault();
+      showStockCtxMenu(ev.clientX, ev.clientY, s.code);
+    };
     body.appendChild(tr);
   });
 }
@@ -547,6 +684,7 @@ function buildSignalMarks(klines, sigs) {
   const marks = [];
   const stacked = {};   // 同一根K线多个信号时横向错开
   sigs.forEach(s => {
+    if (signalFilter[s.strategy] === false) return;   // 信号筛选：隐藏的策略不标注
     const rm = (s.reason || "").match(/(\d{4}-\d{2}-\d{2})(?: (\d{2}:\d{2}))?/);
     const sigDay = rm ? rm[1] : s.ts.slice(0, 10);
     const sigTime = rm ? rm[2] || null : s.ts.slice(11, 16);
@@ -676,6 +814,8 @@ function addSignal(s, flash) {
   const list = $("signalList");
   const div = document.createElement("div");
   div.className = "sig" + (flash ? " flash" : "");
+  div.dataset.strategy = s.strategy;
+  if (signalFilter[s.strategy] === false) div.style.display = "none";
   const pct = s.change_pct || 0;
   div.innerHTML =
     `<span class="code" data-code="${s.code}" title="点击查看K线">${s.code}</span>` +
@@ -691,42 +831,63 @@ function addSignal(s, flash) {
 }
 
 // ---------------------------------------------------------------------------
-// 形态筛选（阳包阴等短线形态全池扫描）
+// 战法筛选（把买入规则应用到指定交易日的K线上，选出触发规则的股票）
 // ---------------------------------------------------------------------------
 function switchPanel(which) {
   $("tabSignals").className = "panel-tab" + (which === "signals" ? " on" : "");
   $("tabScan").className = "panel-tab" + (which === "scan" ? " on" : "");
   $("signalPanel").style.display = which === "signals" ? "flex" : "none";
   $("scanPanel").style.display = which === "scan" ? "flex" : "none";
-  if (which === "scan" && !$("scanPattern").options.length) initScanPatterns();
+  if (which === "scan" && !$("scanRule").options.length) initScanRules();
 }
 
-async function initScanPatterns() {
+async function initScanRules() {
   try {
-    const r = await fetch("/api/patterns");
+    const r = await fetch("/api/backtest/rules");
     const d = await r.json();
-    const sel = $("scanPattern");
-    (d.patterns || []).forEach(p => {
+    const sel = $("scanRule");
+    (d.buy_rules || []).forEach(p => {
       const o = document.createElement("option");
       o.value = p.key; o.textContent = p.name; o.title = p.desc;
       sel.appendChild(o);
     });
   } catch (e) { /* 忽略 */ }
+  refreshScanScopes();
+}
+
+function refreshScanScopes() {
+  // 扫描范围：股票池/自选 + 每个自定义组一项（value=group-{id}），保持当前选择
+  const sel = $("scanScope");
+  if (!sel) return;
+  const cur = sel.value;
+  sel.innerHTML = "";
+  [["pool", "股票池"], ["watch", "自选"]].forEach(([v, t]) => {
+    const o = document.createElement("option");
+    o.value = v; o.textContent = t;
+    sel.appendChild(o);
+  });
+  customGroups.forEach(g => {
+    const o = document.createElement("option");
+    o.value = "group-" + g.id; o.textContent = "📁 " + g.name;
+    sel.appendChild(o);
+  });
+  if ([...sel.options].some(o => o.value === cur)) sel.value = cur;
 }
 
 async function runScan() {
-  $("scanMsg").textContent = $("scanScope").value === "all"
-    ? "全市场扫描中，首次约半分钟…" : "查询中…";
+  $("scanMsg").textContent = "查询中…";
   $("scanList").innerHTML = "";
+  const scopeVal = $("scanScope").value;
   const params = new URLSearchParams({
-    pattern: $("scanPattern").value || "yang_bao_yin",
+    rule: $("scanRule").value,
     period: $("scanPeriod").value,
-    window: $("scanWindow").value,
+    mode: $("scanMode").value,
     day: $("scanDay").value,
-    scope: $("scanScope").value,
+    scope: scopeVal.startsWith("group-") ? "group" : scopeVal,
   });
+  if (scopeVal.startsWith("group-")) params.set("group_id", scopeVal.slice(6));
   try {
-    const r = await fetch("/api/scan?" + params);
+    const r = await fetch("/api/scan-rules?" + params);
     renderScan(await r.json());
   } catch (e) { $("scanMsg").textContent = "查询失败"; }
 }
@@ -736,47 +897,33 @@ function renderScan(d) {
   drawScanList(d);
 }
 
-function applyTrendFilter() {
-  if (lastScanData) drawScanList(lastScanData);
-}
-
-const TREND_BADGE = {
-  up:   m => `<span class="up" title="形态前5根K线累计涨幅">↑上升 ${m.trend_pct > 0 ? '+' : ''}${fmt(m.trend_pct, 1)}%</span>`,
-  down: m => `<span class="down" title="形态前5根K线累计跌幅">↓下降 ${fmt(m.trend_pct, 1)}%</span>`,
-  flat: m => `<span class="muted" title="形态前5根K线波动不足1.5%">→平稳 ${fmt(m.trend_pct, 1)}%</span>`,
-};
-
 function drawScanList(d) {
   const list = $("scanList");
   list.innerHTML = "";
   if (d.ok === false) { $("scanMsg").textContent = d.msg || "查询失败"; return; }
+  const scopeTxt = d.scope === "watch" ? "自选" : d.scope === "group"
+    ? (customGroups.find(g => g.id === d.group_id) || {}).name || "自定义组"
+    : "股票池";
+  const modeTxt = d.mode === "close" ? "买入战法" : "盘中异动";
   if (!d.matches || !d.matches.length) {
-    $("scanMsg").textContent = d.msg || (d.date ? `${d.date} 未找到符合条件的股票` : "无数据");
+    $("scanMsg").textContent = d.msg
+      || `${d.date || "该日"} ${scopeTxt}·${modeTxt} 未找到触发「${d.rule_name}」的股票`;
     return;
   }
-  const filter = $("scanTrend").value;
-  const matches = filter === "all" ? d.matches : d.matches.filter(m => m.trend === filter);
-  const scopeTxt = d.scope === "all" ? "全市场" : "股票池";
-  if (!matches.length) {
-    $("scanMsg").textContent = `${d.date} ${scopeTxt}命中 ${d.matches.length} 只，但无${filter === "up" ? "上升" : filter === "down" ? "下降" : "平稳"}趋势的`;
-    return;
-  }
-  const filterTxt = filter === "all" ? "" : `（已筛选 ${matches.length}/${d.matches.length}）`;
   $("scanMsg").textContent =
-    `${d.date} ${scopeTxt}命中 ${d.matches.length} 只${filterTxt} · 扫描 ${d.scanned} 只(取到 ${d.fetched}) · ${d.elapsed_ms}ms`;
-  matches.forEach(m => {
+    `${d.date} ${scopeTxt}·${modeTxt}「${d.rule_name}」命中 ${d.matches.length} 只 · ` +
+    `扫描 ${d.scanned} 只(取到 ${d.fetched}) · ${d.elapsed_ms}ms`;
+  d.matches.forEach(m => {
     const div = document.createElement("div");
     div.className = "scan-item";
     const pct = m.change_pct || 0;
-    const hitTimes = (m.hits || []).map(h => h.ts.slice(5)).join("，");
-    const trendHtml = (TREND_BADGE[m.trend] || TREND_BADGE.flat)(m);
     div.innerHTML =
       `<span style="color:var(--accent)">${m.code}</span>` +
       `<span>${m.name || ''}</span>` +
       `<span>${fmt(m.price, 2)}</span>` +
       `<span class="${pct > 0 ? 'up' : pct < 0 ? 'down' : 'flat'}">${pct > 0 ? '+' : ''}${pct.toFixed(2)}%</span>` +
-      trendHtml +
-      `<span class="muted">触发：${hitTimes}</span>`;
+      `<span class="muted" style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${m.reason || ''}</span>`;
+    div.title = `${m.reason || ''} @ ${m.ts || ''}`;
     div.onclick = () => {
       selectedCode = m.code;
       if (currentPeriod !== d.period) {
@@ -793,12 +940,13 @@ function drawScanList(d) {
 }
 
 // ---------------------------------------------------------------------------
-// 自选股
+// 自选股 / 自定义分组
 // ---------------------------------------------------------------------------
 function setView(mode) {
   viewMode = mode;
   $("tabAll").className = "aside-tab" + (mode === "all" ? " on" : "");
   $("tabWatch").className = "aside-tab" + (mode === "watch" ? " on" : "");
+  renderGroupTabs();   // 重建组 tab（也负责 on 态与改名同步）
   renderTable();
 }
 
@@ -808,14 +956,208 @@ function refreshWatchCount() {
 
 async function loadWatch() {
   try {
-    const [r, rp] = await Promise.all([fetch("/api/watch"), fetch("/api/pool")]);
+    const [r, rp, rg] = await Promise.all([
+      fetch("/api/watch"), fetch("/api/pool"), fetch("/api/custom/groups")]);
     const d = await r.json();
     watchSet = new Set((d.watch || []).map(w => w.code));
     refreshWatchCount();
+    const gd = await rg.json();
+    customGroups = gd.groups || [];
+    renderGroupTabs();
+    refreshScanScopes();
     const pd = await rp.json();
     $("poolCount").textContent = `(${(pd.stocks || []).length})`;
     renderTable();
   } catch (e) { /* 忽略 */ }
+}
+
+// ------------------------- 分组：建组/改名/删除/加入 -------------------------
+
+async function loadGroups() {
+  try {
+    const r = await fetch("/api/custom/groups");
+    const d = await r.json();
+    customGroups = d.groups || [];
+    renderGroupTabs();
+    refreshScanScopes();
+    renderTable();
+  } catch (e) { /* 忽略 */ }
+}
+
+function renderGroupTabs() {
+  document.querySelectorAll(".aside-tab.group-tab").forEach(el => el.remove());
+  const addBtn = $("tabAddGroup");
+  customGroups.forEach(g => {
+    const tab = document.createElement("span");
+    tab.className = "aside-tab group-tab" + (viewMode === "group:" + g.id ? " on" : "");
+    tab.textContent = "📁 " + g.name + (g.stocks.length ? `(${g.stocks.length})` : "");
+    tab.title = `「${g.name}」${g.stocks.length} 只；右键可改名/删除`;
+    tab.onclick = () => setView("group:" + g.id);
+    tab.oncontextmenu = ev => {
+      ev.preventDefault();
+      showGroupCtxMenu(ev.clientX, ev.clientY, g.id, g.name);
+    };
+    addBtn.parentNode.insertBefore(tab, addBtn);
+  });
+}
+
+async function promptAddGroup(afterCode) {
+  showModal({ title: "新建自定义组", input: true, placeholder: "组名，如：白酒 / 新能源" },
+    async name => {
+      if (!name) return;
+      const r = await fetch("/api/custom/groups", { method: "POST",
+        headers: { "Content-Type": "application/json" }, body: JSON.stringify({ name }) });
+      const d = await r.json();
+      $("statusMsg").textContent = d.msg || "已新建组";
+      if (d.ok && afterCode) {
+        addStockToGroup(afterCode, d.id);   // 右键菜单里“新建组”直接带着这只股票入组
+        return;
+      }
+      if (d.ok) { await loadGroups(); setView("group:" + d.id); }
+    });
+}
+
+async function renameGroup(gid, oldName) {
+  showModal({ title: "重命名自定义组", input: true, value: oldName },
+    async name => {
+      if (!name || name === oldName) return;
+      const r = await fetch(`/api/custom/groups/${gid}/rename`, { method: "POST",
+        headers: { "Content-Type": "application/json" }, body: JSON.stringify({ name }) });
+      const d = await r.json();
+      $("statusMsg").textContent = d.msg || "已改名";
+      if (d.ok) await loadGroups();
+    });
+}
+
+async function removeGroup(gid) {
+  const g = customGroups.find(x => x.id === gid);
+  showModal({
+    title: "删除自定义组", okText: "删除",
+    msg: `确定删除「${g ? g.name : gid}」吗？\n组内股票在其他列表中的状态不受影响。`,
+  }, async ok => {
+    if (!ok) return;
+    const r = await fetch(`/api/custom/groups/${gid}`, { method: "DELETE" });
+    const d = await r.json();
+    $("statusMsg").textContent = d.msg || "组已删除";
+    if (viewMode === "group:" + gid) setView("all");
+    await loadGroups();
+  });
+}
+
+async function addStockToGroup(code, gid) {
+  const r = await fetch(`/api/custom/groups/${gid}/stocks`, { method: "POST",
+    headers: { "Content-Type": "application/json" }, body: JSON.stringify({ code }) });
+  const d = await r.json();
+  $("statusMsg").textContent = d.msg || "已加入";
+  if (d.ok) await loadGroups();
+}
+
+async function removeGroupStock(gid, code) {
+  const r = await fetch(`/api/custom/groups/${gid}/stocks/${code}`, { method: "DELETE" });
+  const d = await r.json();
+  $("statusMsg").textContent = d.msg || "已移出";
+  await loadGroups();
+}
+
+// ------------------------- 右键菜单 -------------------------
+
+function hideCtxMenu() {
+  $("ctxMenu").style.display = "none";
+}
+
+// ------------------------- 内联弹窗（建组/改名/删除确认） -------------------------
+// prompt/confirm 在沙盒 iframe 里会被浏览器静默禁用（点击“＋”无反应），
+// 所以用页面自绘弹窗替代，任意环境都可用
+
+let _modalCb = null;
+
+function showModal(opts, cb) {
+  // opts: {title, msg, input=false, value='', placeholder='', okText='确定'}
+  // cb(value)：输入弹窗回传输入值（取消回传 null）；确认弹窗回传 true/false
+  _modalCb = cb;
+  $("modalTitle").textContent = opts.title || "";
+  $("modalMsg").textContent = opts.msg || "";
+  $("modalMsg").style.display = opts.msg ? "" : "none";
+  const input = $("modalInput");
+  if (opts.input) {
+    input.style.display = "";
+    input.value = opts.value || "";
+    input.placeholder = opts.placeholder || "";
+    input.focus();
+  } else {
+    input.style.display = "none";
+  }
+  $("modalOk").textContent = opts.okText || "确定";
+  $("modalMask").style.display = "flex";
+}
+
+function closeModal(value) {
+  $("modalMask").style.display = "none";
+  const cb = _modalCb;
+  _modalCb = null;
+  if (cb) cb(value);
+}
+
+function _modalInputVisible() {
+  return $("modalInput").style.display !== "none";
+}
+
+$("modalOk").onclick = () => closeModal(
+  _modalInputVisible() ? $("modalInput").value.trim() : true);
+$("modalCancel").onclick = () => closeModal(_modalInputVisible() ? null : false);
+$("modalMask").addEventListener("click", e => {
+  if (e.target === $("modalMask")) $("modalCancel").onclick();
+});
+$("modalInput").addEventListener("keydown", e => {
+  if (e.key === "Enter") $("modalOk").onclick();
+  else if (e.key === "Escape") $("modalCancel").onclick();
+});
+
+function _ctxItem(text, fn) {
+  const item = document.createElement("div");
+  item.className = "ctx-item";
+  item.textContent = text;
+  item.onclick = () => { hideCtxMenu(); fn(); };
+  return item;
+}
+
+function showStockCtxMenu(x, y, code) {
+  const menu = $("ctxMenu");
+  menu.innerHTML = "";
+  const title = document.createElement("div");
+  title.className = "ctx-item";
+  title.style.cursor = "default";
+  title.textContent = `${code} → 加入组`;
+  title.style.color = "var(--muted)";
+  menu.appendChild(title);
+  customGroups.forEach(g => {
+    const inGroup = g.stocks.some(s => s.code === code);
+    menu.appendChild(_ctxItem((inGroup ? "✓ " : "📁 ") + g.name,
+      () => addStockToGroup(code, g.id)));
+  });
+  if (!customGroups.length) {
+    const tip = document.createElement("div");
+    tip.className = "ctx-item";
+    tip.style.cursor = "default";
+    tip.style.color = "var(--muted)";
+    tip.textContent = "（还没有自定义组）";
+    menu.appendChild(tip);
+  }
+  menu.appendChild(document.createElement("div")).className = "ctx-sep";
+  menu.appendChild(_ctxItem("＋ 新建组并加入…", () => promptAddGroup(code)));
+  menu.style.display = "block";
+  menu.style.left = Math.min(x, window.innerWidth - 160) + "px";
+  menu.style.top = Math.min(y, window.innerHeight - 160) + "px";
+}
+
+function showGroupCtxMenu(x, y, gid, name) {
+  const menu = $("ctxMenu");
+  menu.innerHTML = "";
+  menu.appendChild(_ctxItem("✏️ 改名", () => renameGroup(gid, name)));
+  menu.appendChild(_ctxItem("🗑 删除组", () => removeGroup(gid)));
+  menu.style.display = "block";
+  menu.style.left = Math.min(x, window.innerWidth - 160) + "px";
+  menu.style.top = Math.min(y, window.innerHeight - 100) + "px";
 }
 
 async function toggleWatch(code) {
@@ -936,6 +1278,7 @@ $("addCode").addEventListener("keydown", e => {
 });
 document.addEventListener("click", e => {
   if (!e.target.closest(".search-wrap")) hideSuggest();
+  if (!e.target.closest(".ctx-menu")) hideCtxMenu();
 });
 
 function fmt(v, n) { return (v == null || isNaN(v)) ? "--" : Number(v).toFixed(n); }
