@@ -181,7 +181,6 @@ class Scanner:
                 code=code, name=snap.get("name", ""), snap=snap,
                 daily=self.bars["daily"].get(code, []),
                 bars=self._bars_of(code),
-                params=self.engine.params,
             )
             for hit in self.engine.evaluate(ctx, kind="snapshot"):
                 await self._emit_signal(ctx, hit)
@@ -241,7 +240,6 @@ class Scanner:
                 daily=self.bars["daily"].get(code, []),
                 k60=self.bars["60m"].get(code, []),
                 bars=self._bars_of(code),
-                params=self.engine.params,
             )
             for hit in self.engine.evaluate(ctx, kind="kline"):
                 await self._emit_signal(ctx, hit)

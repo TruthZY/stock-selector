@@ -24,14 +24,15 @@ class StockContext:
     # daily/k60 是其中两个周期的便捷别名（现有策略在用）；
     # 需要按周期取用（如把回测的 BuyRule 接进来）走这里
     bars: Dict[str, List[dict]] = field(default_factory=dict)
-    params: Dict = field(default_factory=dict)        # 策略参数
+    # 刻意不放 params：策略参数由 StrategyEngine.evaluate 按策略 key 切片后
+    # 作为第二个入参显式传给实现。这里放一份就会有人拿整个嵌套字典当扁平参数用
 
 
 # ---------------------------------------------------------------------------
 # 策略实现（返回 (命中, 原因)）
 # ---------------------------------------------------------------------------
 
-def _ma_bull(ctx: StockContext) -> tuple:
+def _ma_bull(ctx: StockContext, params: Dict) -> tuple:
     """日K均线多头排列：MA5>MA10>MA20>MA60，且收于MA5上方"""
     daily = ctx.daily
     if len(daily) < 60:
@@ -49,7 +50,7 @@ def _ma_bull(ctx: StockContext) -> tuple:
     return False, ""
 
 
-def _ma_golden_cross(ctx: StockContext) -> tuple:
+def _ma_golden_cross(ctx: StockContext, params: Dict) -> tuple:
     """日K MA5 上穿 MA10（最新一根K线发生）"""
     daily = ctx.daily
     if len(daily) < 12:
@@ -60,23 +61,26 @@ def _ma_golden_cross(ctx: StockContext) -> tuple:
     return False, ""
 
 
-def _macd_golden(ctx: StockContext) -> tuple:
-    """60分钟K MACD：DIF 上穿 DEA"""
-    k60 = ctx.k60
-    if len(k60) < 35:
-        return False, "60分钟K数据不足"
-    closes = [k["close"] for k in k60]
+def _macd_golden(ctx: StockContext, params: Dict) -> tuple:
+    """MACD：DIF 上穿 DEA，周期由 params["period"] 指定（默认 60m）
+
+    此前写死取 ctx.k60，config 里那个 {"period": "60m"} 从来没被读过
+    """
+    period = str(params.get("period") or "60m")
+    bars = (ctx.bars or {}).get(period) or (ctx.k60 if period == "60m" else [])
+    if len(bars) < 35:
+        return False, f"{period} K线数据不足"
+    closes = [k["close"] for k in bars]
     dif, dea, _ = ta.macd(closes)
     if ta.cross_up(dif, dea):
-        return True, f"DIF上穿DEA @ {k60[-1]['ts']}"
+        return True, f"{period} DIF上穿DEA @ {bars[-1]['ts']}"
     return False, ""
 
 
-def _volume_breakout(ctx: StockContext) -> tuple:
+def _volume_breakout(ctx: StockContext, params: Dict) -> tuple:
     """放量突破：量比≥阈值 且 现价突破 N 日最高（不含今日）"""
     snap = ctx.snap
     daily = ctx.daily
-    params = ctx.params
     if not snap or not daily:
         return False, "数据不足"
     ratio = ta.volume_ratio(snap["volume"], [k["volume"] for k in daily[:-1]])
@@ -91,19 +95,19 @@ def _volume_breakout(ctx: StockContext) -> tuple:
     return False, ""
 
 
-def _strong_up(ctx: StockContext) -> tuple:
+def _strong_up(ctx: StockContext, params: Dict) -> tuple:
     """强势拉升：涨幅≥阈值 且 非一字板（开盘价低于涨停价）"""
     snap = ctx.snap
     if not snap:
         return False, "无快照"
-    pct = ctx.params.get("pct", 5.0)
+    pct = params.get("pct", 5.0)
     limit_up = snap.get("limit_up") or 0
     if snap["change_pct"] >= pct and limit_up and snap["open"] < limit_up:
         return True, f"涨幅{snap['change_pct']:.2f}%，现价{snap['price']:.2f}"
     return False, ""
 
 
-def _limit_up(ctx: StockContext) -> tuple:
+def _limit_up(ctx: StockContext, params: Dict) -> tuple:
     """涨停预警：现价触及涨停价"""
     snap = ctx.snap
     if not snap:
@@ -114,7 +118,7 @@ def _limit_up(ctx: StockContext) -> tuple:
     return False, ""
 
 
-def _rsi_oversold(ctx: StockContext) -> tuple:
+def _rsi_oversold(ctx: StockContext, params: Dict) -> tuple:
     """RSI超卖反弹：日K RSI14<阈值 且 当日转涨"""
     snap = ctx.snap
     daily = ctx.daily
@@ -122,12 +126,13 @@ def _rsi_oversold(ctx: StockContext) -> tuple:
         return False, "数据不足"
     closes = [k["close"] for k in daily]
     r = ta.rsi(closes)[-1]
-    if r is not None and r < ctx.params.get("rsi_below", 30.0) and snap["change_pct"] > 0:
-        return True, f"RSI14={r:.1f}<30 且当日转涨{snap['change_pct']:.2f}%"
+    below = params.get("rsi_below", 30.0)
+    if r is not None and r < below and snap["change_pct"] > 0:
+        return True, f"RSI14={r:.1f}<{below} 且当日转涨{snap['change_pct']:.2f}%"
     return False, ""
 
 
-def _low_pe(ctx: StockContext) -> tuple:
+def _low_pe(ctx: StockContext, params: Dict) -> tuple:
     """低估值异动：PE<阈值 且 当日涨幅≥阈值"""
     snap = ctx.snap
     if not snap:
@@ -135,8 +140,8 @@ def _low_pe(ctx: StockContext) -> tuple:
     pe = snap.get("pe") or 0
     if pe <= 0 or math.isnan(pe) or pe > 1e4:  # 排除无效PE
         return False, "PE无效"
-    max_pe = ctx.params.get("max_pe", 15.0)
-    min_pct = ctx.params.get("min_pct", 2.0)
+    max_pe = params.get("max_pe", 15.0)
+    min_pct = params.get("min_pct", 2.0)
     if pe < max_pe and snap["change_pct"] >= min_pct:
         return True, f"PE={pe:.1f}，当日涨幅{snap['change_pct']:.2f}%"
     return False, ""
@@ -147,7 +152,7 @@ def _low_pe(ctx: StockContext) -> tuple:
 # ---------------------------------------------------------------------------
 
 # 策略元信息与实现映射
-STRATEGY_IMPL: Dict[str, Callable[[StockContext], tuple]] = {
+STRATEGY_IMPL: Dict[str, Callable[[StockContext, Dict], tuple]] = {
     "ma_bull": _ma_bull,
     "ma_golden_cross": _ma_golden_cross,
     "macd_golden": _macd_golden,
@@ -171,7 +176,17 @@ class StrategyEngine:
         self.strategies = {
             key: dict(value) for key, value in config.DEFAULT_STRATEGIES.items()
         }
+        # 按策略 key 嵌套：{策略key: {参数名: 值}}。
+        # evaluate 负责把对应策略那一层切出来传给实现——曾经是把整个嵌套字典
+        # 当成 ctx.params 传下去，而实现读的是扁平键，于是 config.STRATEGY_PARAMS
+        # 全程无效、所有策略都跑在硬编码默认值上（改配置没反应）
         self.params = {k: dict(v) for k, v in config.STRATEGY_PARAMS.items()}
+        # 用实际参数渲染 desc 里的 {xxx}，让界面说明跟着参数走
+        for key, meta in self.strategies.items():
+            try:
+                meta["desc"] = meta["desc"].format(**self.params.get(key, {}))
+            except (KeyError, IndexError, ValueError):
+                pass        # 占位符与参数不匹配时保留原文，不因为文案问题崩掉引擎
 
     def toggle(self, key: str, enabled: bool) -> bool:
         if key in self.strategies:
@@ -193,7 +208,8 @@ class StrategyEngine:
             if kind == "kline" and key not in KLINE_STRATEGIES:
                 continue
             try:
-                matched, reason = STRATEGY_IMPL[key](ctx)
+                # 只把该策略自己那一层参数传进去（扁平），实现里读 params.get("xxx")
+                matched, reason = STRATEGY_IMPL[key](ctx, self.params.get(key, {}))
             except Exception:
                 continue
             if matched:

@@ -14,9 +14,9 @@
    会让指标在一根K线内反复翻转、信号乱闪。ts 是K线**结束**时刻，故 ts <= 现在
    即已收盘。
 
-2. **不能用 ctx.params。** 实时引擎把按策略 key 嵌套的 engine.params 整个传给
-   ctx.params，而规则读的是扁平键——这是个已知的潜伏 bug（内置策略因此全部
-   跑在硬编码默认值上）。适配器自建扁平参数，不沾这个坑。
+2. **参数自己建，不吃引擎那份。** 引擎给内置策略传的是 config.STRATEGY_PARAMS
+   的按策略切片；规则信号的参数来自 config.REALTIME_RULE_SIGNALS 的 params，
+   两者来源不同，所以适配器忽略传入的 params、自建扁平参数。
 
 3. **规则实例必须按股票隔离。** 规则把指标缓存成按绝对下标索引的序列
    （self._k[ctx.i]），跨股票共用实例会读到别人的指标值甚至 IndexError。
@@ -124,7 +124,13 @@ class RuleSignal:
 
     # ------------------------- 求值 -------------------------
 
-    def __call__(self, ctx) -> Tuple[bool, str]:
+    def __call__(self, ctx, engine_params: Optional[Dict] = None) -> Tuple[bool, str]:
+        """签名对齐 STRATEGY_IMPL 的 fn(ctx, params)
+
+        engine_params 是引擎给内置策略用的那份（来自 config.STRATEGY_PARAMS），
+        规则信号有自己的参数来源（config.REALTIME_RULE_SIGNALS 的 params），
+        所以这里刻意忽略它
+        """
         self.eval_count += 1
         try:
             return self._evaluate(ctx)

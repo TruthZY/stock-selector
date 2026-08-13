@@ -114,15 +114,17 @@ USER_RULE_SAMPLE_BARS = 5000
 # ---------------------------------------------------------------------------
 # 策略默认开关与参数
 # ---------------------------------------------------------------------------
+# desc 里的 {xxx} 会用下面 STRATEGY_PARAMS 的实际值渲染，
+# 这样界面上策略条的说明始终跟着参数走，不会写死成谎话
 DEFAULT_STRATEGIES = {
     "ma_bull":          {"enabled": True,  "name": "均线多头排列", "desc": "日K MA5>MA10>MA20>MA60 且收于MA5上方"},
     "ma_golden_cross":  {"enabled": True,  "name": "均线金叉",     "desc": "日K MA5 上穿 MA10"},
-    "macd_golden":      {"enabled": True,  "name": "MACD金叉",     "desc": "60分钟K DIF 上穿 DEA"},
-    "volume_breakout":  {"enabled": True,  "name": "放量突破",     "desc": "量比≥2 且 现价突破20日最高"},
-    "strong_up":        {"enabled": True,  "name": "强势拉升",     "desc": "盘中涨幅≥5% 且 非一字板"},
+    "macd_golden":      {"enabled": True,  "name": "MACD金叉",     "desc": "{period} K线 DIF 上穿 DEA"},
+    "volume_breakout":  {"enabled": True,  "name": "放量突破",     "desc": "量比≥{volume_ratio} 且 现价突破{break_days}日最高"},
+    "strong_up":        {"enabled": True,  "name": "强势拉升",     "desc": "盘中涨幅≥{pct}% 且 非一字板"},
     "limit_up":         {"enabled": True,  "name": "涨停预警",     "desc": "现价触及涨停价"},
-    "rsi_oversold":     {"enabled": True,  "name": "RSI超卖反弹",  "desc": "日K RSI14<30 且 当日转涨"},
-    "low_pe":           {"enabled": True,  "name": "低估值异动",   "desc": "PE<15 且 当日上涨≥2%"},
+    "rsi_oversold":     {"enabled": True,  "name": "RSI超卖反弹",  "desc": "日K RSI14<{rsi_below} 且 当日转涨"},
+    "low_pe":           {"enabled": True,  "name": "低估值异动",   "desc": "PE<{max_pe} 且 当日上涨≥{min_pct}%"},
 }
 
 # 策略参数
