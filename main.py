@@ -75,6 +75,15 @@ MIN_PERIODS = {"1m": 1, "5m": 5, "15m": 15, "30m": 30, "60m": 60}
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global scanner
+    # 先把回测买入规则注册成实时策略，再起扫描器：注册要写 engine.strategies，
+    # 而扫描器一启动就会广播策略列表
+    from app.rule_signals import register_rule_signals
+    report = register_rule_signals(engine)
+    if report["loaded"]:
+        print("[rule_signals] 已接入实时信号: " + ", ".join(
+            f"{e['key']}({e['rule']}/{e['period']})" for e in report["loaded"]), flush=True)
+    for e in report["failed"]:
+        print(f"[rule_signals] 跳过 {e['key']}: {e['error']}", flush=True)
     scanner = Scanner(store, ds, engine, manager.broadcast)
     await scanner.start()
     yield
@@ -156,7 +165,22 @@ async def backtest_rules_reload():
     所以此端点不引入新的执行面
     """
     from app.backtest.rules import reload_user_rules
-    return reload_user_rules()
+    from app.rule_signals import register_rule_signals
+    report = reload_user_rules()
+    # 规则可能被改名/改参/删除，实时侧的绑定要一起刷新
+    report["rule_signals"] = register_rule_signals(engine)
+    return report
+
+
+@app.get("/api/rule-signals")
+async def rule_signals():
+    """实时规则信号的注册与运行状况
+
+    实时信号没有结果页，出问题时很难判断是"没命中"还是"根本没跑起来"，
+    所以把绑定关系、命中次数、各股最近已报K线、异常计数都摊开
+    """
+    from app.rule_signals import stats_report
+    return stats_report()
 
 
 @app.get("/api/status")
