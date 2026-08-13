@@ -38,13 +38,3 @@ def last_closed_index(bars: List[dict], now: Optional[datetime] = None) -> Optio
         if is_closed(bars[i]["ts"], now):
             return i
     return None
-
-
-def closed_slice(bars: List[dict], now: Optional[datetime] = None) -> List[dict]:
-    """截到最后一根已收盘K线为止的子序列（未收盘的末根被切掉）
-
-    截断而不是传下标：这样调用方原有的 [-1]、cross_up(整个序列) 之类的写法
-    完全不用改，语义自动变成"以已收盘的最新一根为准"
-    """
-    i = last_closed_index(bars, now)
-    return bars[:i + 1] if i is not None else []

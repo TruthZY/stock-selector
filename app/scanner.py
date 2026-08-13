@@ -181,7 +181,6 @@ class Scanner:
                 continue
             ctx = strat.StockContext(
                 code=code, name=snap.get("name", ""), snap=snap,
-                daily=self.bars["daily"].get(code, []),
                 bars=self._bars_of(code),
             )
             for hit in self.engine.evaluate(ctx, kind="snapshot"):
@@ -239,16 +238,52 @@ class Scanner:
                 continue
             ctx = strat.StockContext(
                 code=code, name=snap.get("name", ""), snap=snap,
-                daily=self.bars["daily"].get(code, []),
-                k60=self.bars["60m"].get(code, []),
                 bars=self._bars_of(code),
             )
             for hit in self.engine.evaluate(ctx, kind="kline"):
                 await self._emit_signal(ctx, hit)
 
+    @staticmethod
+    def _live_daily_bar(snap: dict) -> Optional[dict]:
+        """用实时快照拼一根"当日日K"
+
+        快照字段与日K字段 1:1 对应（open/high/low/price/volume/amount 全都有，
+        成交量单位同为手，实测差 0.00%），所以能拼出一根 3 秒新鲜的当日K线。
+
+        用途：盘中异动类规则判定的是"末根"，而 self.bars 只在K线循环（30 秒且
+        错峰）更新，直接用会把延迟从 3 秒退化成 30~60 秒。让规则读到这根新鲜的
+        末根，就能同时拿到低延迟与"规则仍是纯K线逻辑、依然可回测"
+        """
+        try:
+            price = float(snap.get("price") or 0)
+            if price <= 0:
+                return None
+            return {"ts": time.strftime("%Y-%m-%d"),
+                    "open": float(snap.get("open") or price),
+                    "high": float(snap.get("high") or price),
+                    "low": float(snap.get("low") or price),
+                    "close": price,
+                    "volume": float(snap.get("volume") or 0),
+                    "amount": float(snap.get("amount") or 0)}
+        except (TypeError, ValueError):
+            return None
+
     def _bars_of(self, code: str) -> Dict[str, List[dict]]:
-        """该股各周期K线，供按周期取用（回测规则适配器用得上）"""
-        return {p: self.bars[p].get(code, []) for p in self.bars}
+        """该股各周期K线，供按周期取用（规则适配器按周期取）
+
+        盘中把日线末根换成实时快照拼出的当日K线。只是给规则求值用的内存视图，
+        **不写库**——落库仍由K线同步负责，避免又多一个写者污染 klines
+        """
+        out = {p: self.bars[p].get(code, []) for p in self.bars}
+        live = self._live_daily_bar(self.snapshots.get(code) or {}) \
+            if is_trading_time() else None
+        if live:
+            daily = out.get("daily") or []
+            if daily and daily[-1]["ts"][:10] == live["ts"]:
+                out["daily"] = daily[:-1] + [live]      # 同日：替换末根
+            else:
+                out["daily"] = daily + [live]           # 跨日：追加今日
+        return out
 
     # ------------------------------------------------------------------
     # 信号与广播

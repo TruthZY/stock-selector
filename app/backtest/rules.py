@@ -384,6 +384,142 @@ class KdjGoldenBuy(BuyRule):
 
 
 # ---------------------------------------------------------------------------
+# 盘中异动类规则
+#
+# 这四条原本是实时侧写死的"快照策略"，读腾讯快照的 price/change_pct/volume/
+# limit_up 等字段，因此永远无法回测。改写成纯K线表达后它们既能上实时盘、
+# 也能在验证台跑历史——关键是**未收盘那根K线本身就携带当日实时信息**：
+# 末根的 volume 就是当日累计量、close 就是当前价。
+#
+# 配 confirm_on_close=False 时判定末根（进行中）→ 盘中即时语义；
+# 配 True 时判定最后一根已收盘 → 与回测逐根一致。两种模式见
+# config.REALTIME_RULE_SIGNALS
+# ---------------------------------------------------------------------------
+
+
+def _day_change_pct(bars: list, i: int) -> Optional[float]:
+    """当日涨幅%：(今收 - 昨收) / 昨收。前复权序列上前后两根同基准，比值成立"""
+    if i < 1:
+        return None
+    prev = bars[i - 1]["close"]
+    return (bars[i]["close"] - prev) / prev * 100.0 if prev else None
+
+
+def _limit_pct_by_code(code: str) -> float:
+    """按代码前缀推涨停幅度%：创业板/科创板 20%，其余 10%
+
+    近似判据，不等于交易所口径：ST 股是 5%、上市首日不设限、北交所 30%。
+    实时侧原来读快照的 limit_up 字段（交易所给的真实涨停价），改成纯K线表达
+    后只能这样推——换来的是可回测
+    """
+    return 20.0 if code.startswith(("30", "68")) else 10.0
+
+
+@register_buy("volume_breakout")
+class VolumeBreakoutBuy(BuyRule):
+    """放量突破：量比≥阈值 且 价格突破前 N 根最高"""
+    key = "volume_breakout"
+    name = "放量突破"
+    desc = "量比≥阈值 且 收盘突破前N根最高（量比=当根量/前5根均量）"
+    default_params = {"buy_amount": 10000.0, "volume_ratio": 2.0, "break_days": 20}
+    PARAM_LABELS = {"buy_amount": "每笔买入金额(元)", "volume_ratio": "量比阈值",
+                    "break_days": "突破回看根数"}
+
+    def on_bar(self, ctx: BarContext) -> Optional[Signal]:
+        i, bars = ctx.i, ctx.bars
+        days = int(self.params["break_days"])
+        if i < max(days, 6):
+            return None
+        bar = bars[i]
+        base = [k["volume"] for k in bars[i - 5:i]]          # 前5根均量（不含当根）
+        avg = sum(base) / len(base) if base else 0.0
+        if avg <= 0:
+            return None
+        ratio = bar["volume"] / avg
+        if ratio < float(self.params["volume_ratio"]):
+            return None
+        top = max(k["high"] for k in bars[i - days:i])       # 前N根最高（不含当根）
+        if not (top > 0 and bar["close"] > top):
+            return None
+        return Signal("buy", amount=float(self.params["buy_amount"]),
+                      reason=f"量比{ratio:.1f}倍，{bar['close']:.2f}突破{days}根高点{top:.2f}")
+
+
+@register_buy("rsi_oversold")
+class RsiOversoldBuy(BuyRule):
+    """RSI超卖反弹：RSI<阈值 且 当根转涨"""
+    key = "rsi_oversold"
+    name = "RSI超卖反弹"
+    desc = "RSI低于阈值 且 当根收盘高于上一根（超卖后转涨）"
+    default_params = {"buy_amount": 10000.0, "rsi_n": 14, "rsi_below": 30.0}
+    PARAM_LABELS = {"buy_amount": "每笔买入金额(元)", "rsi_n": "RSI周期",
+                    "rsi_below": "RSI上限"}
+
+    def reset(self) -> None:
+        super().reset()
+        self._r = []
+
+    def prepare(self, bars: list) -> None:
+        self._r = ta.rsi([k["close"] for k in bars], int(self.params["rsi_n"]))
+
+    def on_bar(self, ctx: BarContext) -> Optional[Signal]:
+        i = ctx.i
+        if i < 1 or self._r[i] is None:
+            return None
+        chg = _day_change_pct(ctx.bars, i)
+        if chg is None or chg <= 0:
+            return None
+        if self._r[i] >= float(self.params["rsi_below"]):
+            return None
+        return Signal("buy", amount=float(self.params["buy_amount"]),
+                      reason=f"RSI{self.params['rsi_n']}={self._r[i]:.1f}"
+                             f"<{self.params['rsi_below']} 且转涨{chg:+.2f}%")
+
+
+@register_buy("strong_up")
+class StrongUpBuy(BuyRule):
+    """强势拉升：涨幅≥阈值 且 非一字板"""
+    key = "strong_up"
+    name = "强势拉升"
+    desc = "涨幅≥阈值 且 非一字板（四价相等视为一字板，无法买入）"
+    default_params = {"buy_amount": 10000.0, "pct": 5.0}
+    PARAM_LABELS = {"buy_amount": "每笔买入金额(元)", "pct": "涨幅阈值%"}
+
+    def on_bar(self, ctx: BarContext) -> Optional[Signal]:
+        bar, chg = ctx.bar(), _day_change_pct(ctx.bars, ctx.i)
+        if chg is None or chg < float(self.params["pct"]):
+            return None
+        # 一字板：开=高=低=收，全天封死买不进。原实现靠快照的 limit_up
+        # 比较开盘价，这里用四价相等判定，不需要涨停价
+        if bar["open"] == bar["high"] == bar["low"] == bar["close"]:
+            return None
+        return Signal("buy", amount=float(self.params["buy_amount"]),
+                      reason=f"涨幅{chg:+.2f}%，价{bar['close']:.2f}")
+
+
+@register_buy("limit_up")
+class LimitUpBuy(BuyRule):
+    """涨停预警：涨幅接近涨停幅度"""
+    key = "limit_up"
+    name = "涨停预警"
+    desc = "涨幅达涨停幅度的99%以上；幅度按代码前缀推（创业板/科创板20%，其余10%）"
+    default_params = {"buy_amount": 10000.0, "limit_pct": 0.0}
+    PARAM_LABELS = {"buy_amount": "每笔买入金额(元)",
+                    "limit_pct": "涨停幅度%(0=按代码自动)"}
+
+    def on_bar(self, ctx: BarContext) -> Optional[Signal]:
+        chg = _day_change_pct(ctx.bars, ctx.i)
+        if chg is None:
+            return None
+        limit = float(self.params.get("limit_pct") or 0) or _limit_pct_by_code(ctx.code)
+        if chg < limit * 0.99:
+            return None
+        return Signal("buy", amount=float(self.params["buy_amount"]),
+                      reason=f"涨幅{chg:+.2f}% 触及涨停(约{limit:.0f}%)，"
+                             f"价{ctx.bar()['close']:.2f}")
+
+
+# ---------------------------------------------------------------------------
 # 卖出规则
 # ---------------------------------------------------------------------------
 

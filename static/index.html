@@ -35,6 +35,14 @@
     transition: all .15s;
   }
   .strat-chip.on { color: var(--accent); border-color: var(--accent); background: rgba(88,166,255,.12); }
+  /* 两类信号分组：买入战法（收盘确认）与盘中异动（即时、会撤）用不同底色区分 */
+  .strat-group { display: inline-flex; align-items: center; gap: 5px; margin-right: 14px; }
+  .strat-group-label {
+    font-size: 11px; color: var(--muted); opacity: .75;
+    border-right: 1px solid var(--border); padding-right: 7px; cursor: help;
+  }
+  .strat-chip.k-buy.on { color: #7ee787; border-color: #7ee787; background: rgba(126,231,135,.12); }
+  .strat-chip.k-alert.on { color: #d29922; border-color: #d29922; background: rgba(210,153,34,.12); }
   .add-box { display: flex; gap: 6px; margin-left: auto; }
   .search-wrap { position: relative; }
   .search-wrap input {
@@ -267,11 +275,24 @@
 // 全局状态
 // ---------------------------------------------------------------------------
 const PERIOD_LABEL = { daily: "日K", "60m": "60分", "30m": "30分", "15m": "15分", "5m": "5分", "1m": "1分" };
-const BADGE_CLASS = { ma_bull: "b-ma", ma_golden_cross: "b-ma", macd_golden: "b-ma",
-  volume_breakout: "b-vol", strong_up: "b-up", limit_up: "b-up", rsi_oversold: "b-rsi", low_pe: "b-pe" };
-const STRAT_COLOR = { ma_bull: "#d2a8ff", ma_golden_cross: "#d2a8ff", macd_golden: "#d2a8ff",
-  volume_breakout: "#7ee787", strong_up: "#ef232a", limit_up: "#ef232a",
-  rsi_oversold: "#d29922", low_pe: "#79c0ff" };
+// 信号类别：buy=买入战法（收盘确认，与回测一致）/ alert=盘中异动（即时，会撤）
+// 颜色与 badge 按类别给，不再逐个策略 key 硬编码——实时信号现在全由
+// config.REALTIME_RULE_SIGNALS 动态注册，写死 key 必然过时
+const KIND_LABEL = { buy: "买入", alert: "异动" };
+const KIND_COLOR = { buy: "#7ee787", alert: "#d29922" };
+const KIND_BADGE = { buy: "b-ma", alert: "b-up" };
+function stratKind(key) { return (stratDefs[key] || {}).kind || ""; }
+function stratColor(key) { return KIND_COLOR[stratKind(key)] || "#d2a8ff"; }
+// 信号标题：「买入·KDJ+RSI双金叉共振 30m」/「异动·涨停预警」
+// 已删策略的历史信号查不到 kind，退化成只显示名字
+function stratTitle(key, fallbackName) {
+  const d = stratDefs[key] || {};
+  const name = d.name || fallbackName || key;
+  const label = KIND_LABEL[d.kind];
+  if (!label) return name;
+  const per = d.kind === "buy" && d.period ? " " + (PERIOD_LABEL[d.period] || d.period) : "";
+  return label + "·" + name + per;
+}
 
 let snapshots = {};        // code -> snapshot
 let signalMap = {};        // code -> {key: {name, ts}}
@@ -315,7 +336,8 @@ function handleMsg(msg) {
       addSignal(d, true);
       // 记录持有中的信号（K线类保留30分钟，快照类由 hits 维护）
       const sig = signalMap[d.code] || (signalMap[d.code] = {});
-      sig[d.strategy] = { name: d.strategy_name, ts: Date.now(), kind: d.strategy in {volume_breakout:1,strong_up:1,limit_up:1,rsi_oversold:1,low_pe:1} ? "snap" : "kline" };
+      sig[d.strategy] = { name: d.strategy_name, ts: Date.now(),
+        kind: stratKind(d.strategy) === "alert" ? "snap" : "kline" };
       renderTable();
       if (selectedCode === d.code) {
         // 即时标注：直接注入信号并重绘，不等 /api/kline、/api/signals 往返
@@ -349,23 +371,42 @@ function strategyName(key) {
 // ---------------------------------------------------------------------------
 function buildStratBar(strats) {
   stratDefs = {};
+  strats.forEach(s => { stratDefs[s.key] = s; });
   const bar = $("stratBar");
   bar.innerHTML = "";
-  strats.forEach(s => {
-    stratDefs[s.key] = s;
-    const chip = document.createElement("span");
-    chip.className = "strat-chip" + (s.enabled ? " on" : "");
-    chip.textContent = s.name;
-    chip.title = s.desc;
-    chip.onclick = async () => {
-      const on = !s.enabled;
-      s.enabled = on;
-      chip.className = "strat-chip" + (on ? " on" : "");
-      await fetch("/api/strategies/toggle", { method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ key: s.key, enabled: on }) });
-    };
-    bar.appendChild(chip);
+  // 分两组：买入战法（收盘确认、与回测逐根一致）/ 盘中异动（判定进行中K线、会撤）
+  const groups = [
+    { kind: "buy", label: "买入战法", hint: "收盘确认，与验证台回测逐根一致，报了不撤" },
+    { kind: "alert", label: "盘中异动", hint: "判定进行中K线，即时但可能撤销，仅作提醒" },
+  ];
+  groups.forEach(g => {
+    const items = strats.filter(s => (s.kind || "buy") === g.kind);
+    if (!items.length) return;
+    const wrap = document.createElement("span");
+    wrap.className = "strat-group";
+    const lab = document.createElement("span");
+    lab.className = "strat-group-label";
+    lab.textContent = g.label;
+    lab.title = g.hint;
+    wrap.appendChild(lab);
+    items.forEach(s => {
+      const chip = document.createElement("span");
+      const cls = () => "strat-chip k-" + g.kind + (s.enabled ? " on" : "");
+      chip.className = cls();
+      chip.textContent = s.name + (g.kind === "buy" && s.period
+        ? " " + (PERIOD_LABEL[s.period] || s.period) : "");
+      chip.title = [g.hint, s.rule ? "规则: " + s.rule : "", s.desc]
+        .filter(Boolean).join("\n");
+      chip.onclick = async () => {
+        s.enabled = !s.enabled;
+        chip.className = cls();
+        await fetch("/api/strategies/toggle", { method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ key: s.key, enabled: s.enabled }) });
+      };
+      wrap.appendChild(chip);
+    });
+    bar.appendChild(wrap);
   });
 }
 
@@ -394,7 +435,7 @@ function renderTable() {
     const cls = pct > 0 ? "up" : pct < 0 ? "down" : "flat";
     const watched = watchSet.has(s.code);
     const badges = Object.entries(signalMap[s.code] || {})
-      .map(([k, v]) => `<span class="badge ${BADGE_CLASS[k] || 'b-ma'}">${v.name}</span>`).join("");
+      .map(([k, v]) => `<span class="badge ${KIND_BADGE[stratKind(k)] || 'b-ma'}">${v.name}</span>`).join("");
     tr.innerHTML =
       `<td style="text-align:center" class="star${watched ? ' on' : ''}" title="${watched ? '移出自选' : '加入自选'}">${watched ? '★' : '☆'}</td>` +
       `<td>${s.code}</td><td>${s.name}</td>` +
@@ -410,12 +451,13 @@ function renderTable() {
 
 function updateHits(hits) {
   const now = Date.now();
-  const snapKeys = { volume_breakout: 1, strong_up: 1, limit_up: 1, rsi_oversold: 1, low_pe: 1 };
-  const hitNow = new Set(hits.map(h => `${h.code}:${h.strategy}`));
+  // 命中项的策略字段名是 key（scanner 广播 {"code","name", **hit}，hit 里是 key）。
+  // 这里原本读 h.strategy，恒为 undefined，导致快照类 badge 的保活判断一直失效
+  const hitNow = new Set(hits.map(h => `${h.code}:${h.key}`));
   for (const code in signalMap) {
     for (const key in signalMap[code]) {
       const v = signalMap[code][key];
-      const isSnap = key in snapKeys;
+      const isSnap = stratKind(key) === "alert";
       const present = hitNow.has(`${code}:${key}`);
       const ttl = isSnap ? 90 * 1000 : 30 * 60 * 1000;
       if (isSnap && !present && now - v.ts > 60 * 1000) delete signalMap[code][key];
@@ -534,7 +576,7 @@ function buildSignalMarks(klines, sigs) {
       coord: [idx, klines[idx].high],
       symbolOffset: [off, 0],
       short: strategyName(s.strategy).slice(0, 2),
-      itemStyle: { color: STRAT_COLOR[s.strategy] || "#d2a8ff" },
+      itemStyle: { color: stratColor(s.strategy) },
       sig: s,
     });
   });
@@ -604,7 +646,7 @@ function renderChart(klines, sigs) {
             formatter: p => {
               const s = p.data.sig;
               const pct = s.change_pct || 0;
-              return `<b style="color:${STRAT_COLOR[s.strategy] || '#d2a8ff'}">${strategyName(s.strategy)}</b><br/>`
+              return `<b style="color:${stratColor(s.strategy)}">${stratTitle(s.strategy)}</b><br/>`
                 + `${s.code} ${s.name || ''} · ${s.ts}<br/>`
                 + `价格 ${fmt(s.price, 2)} · ${pct > 0 ? '+' : ''}${pct.toFixed(2)}%<br/>`
                 + `${s.reason || ''}`;
@@ -638,7 +680,7 @@ function addSignal(s, flash) {
   div.innerHTML =
     `<span class="code" data-code="${s.code}" title="点击查看K线">${s.code}</span>` +
     `<span>${s.name || ''}</span>` +
-    `<span class="strat">${s.strategy_name || s.strategy}</span>` +
+    `<span class="strat">${stratTitle(s.strategy, s.strategy_name)}</span>` +
     `<span class="${pct > 0 ? 'up' : pct < 0 ? 'down' : 'flat'}">${pct > 0 ? '+' : ''}${pct.toFixed(2)}%</span>` +
     `<span class="reason">${s.reason || ''}</span>` +
     `<span class="muted" style="margin-left:auto">${s.ts}</span>`;

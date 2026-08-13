@@ -111,56 +111,67 @@ USER_RULE_BUDGET_MS = 500.0
 # 门禁样本根数（从本地缓存里取最长的一条序列，不足则用实际根数归一化）
 USER_RULE_SAMPLE_BARS = 5000
 
-# ---------------------------------------------------------------------------
-# 策略默认开关与参数
-# ---------------------------------------------------------------------------
-# desc 里的 {xxx} 会用下面 STRATEGY_PARAMS 的实际值渲染，
-# 这样界面上策略条的说明始终跟着参数走，不会写死成谎话
-DEFAULT_STRATEGIES = {
-    "ma_bull":          {"enabled": True,  "name": "均线多头排列", "desc": "日K MA5>MA10>MA20>MA60 且收于MA5上方"},
-    "ma_golden_cross":  {"enabled": True,  "name": "均线金叉",     "desc": "日K MA5 上穿 MA10"},
-    "macd_golden":      {"enabled": True,  "name": "MACD金叉",     "desc": "{period} K线 DIF 上穿 DEA"},
-    "volume_breakout":  {"enabled": True,  "name": "放量突破",     "desc": "量比≥{volume_ratio} 且 现价突破{break_days}日最高"},
-    "strong_up":        {"enabled": True,  "name": "强势拉升",     "desc": "盘中涨幅≥{pct}% 且 非一字板"},
-    "limit_up":         {"enabled": True,  "name": "涨停预警",     "desc": "现价触及涨停价"},
-    "rsi_oversold":     {"enabled": True,  "name": "RSI超卖反弹",  "desc": "日K RSI14<{rsi_below} 且 当日转涨"},
-    "low_pe":           {"enabled": True,  "name": "低估值异动",   "desc": "PE<{max_pe} 且 当日上涨≥{min_pct}%"},
-}
-
-# 策略参数
-STRATEGY_PARAMS = {
-    "volume_breakout": {"volume_ratio": 2.0, "break_days": 20},
-    "strong_up":       {"pct": 5.0},
-    "low_pe":          {"max_pe": 15.0, "min_pct": 2.0},
-    "rsi_oversold":    {"rsi_below": 30.0},
-    "macd_golden":     {"period": "60m"},
-}
-
 # 同一 (股票, 策略) 信号的最小重报间隔（秒）
 SIGNAL_DEDUP_SECONDS = 30 * 60
 
 # ---------------------------------------------------------------------------
 # 把回测买入规则接到实时信号侦测
 # ---------------------------------------------------------------------------
-# 每条 = 一个实时信号源，与上面 8 个内置策略并列出现在首页策略条上、可开关。
+# 每条 = 一个实时信号源，出现在首页策略条上、可开关。
+# 实时信号**全部**来自这里——原先写死在 app/strategies.py 的 8 个内置策略已删除：
+# 3 个K线类与买入规则完全重复，5 个快照类中 4 个已改写成纯K线规则
+# （volume_breakout/rsi_oversold/strong_up/limit_up），从此可回测；
+# low_pe 因为 PE 无法从K线推导而放弃。
 #   key     实时信号 key，必须唯一。实时去重是按 (股票, key) 做的，
 #           所以同一规则注册多条（不同周期/参数）时每条都要独立 key，否则互相压制
 #   rule    买入规则 key，取自 app/backtest/rules.py（含 user_rules/ 里自定义的）
 #   period  用哪个周期的序列，必须是 REALTIME_PERIODS 里的周期
 #   params  覆盖规则默认参数（扁平，与验证台参数面板一致）
-#   name/desc  可选，缺省用「规则名(周期)」与规则自身 desc
+#   name/desc  可选，缺省用规则自身的名字与 desc
+#   confirm_on_close  True=判定最后一根【已收盘】K线（与回测逐根一致、报了不撤，
+#                     显示为「买入战法」）；False=判定末根【进行中】K线
+#                     （盘中即时、会撤，显示为「盘中异动」）
+#   interval  仅盘中模式生效：每只股票最多每 N 秒求值一次，默认 30。
+#             盘中模式每次求值都要重算 prepare()（末根的值一直在变，
+#             不能靠 ts 做缓存），实测全池一轮 12~65ms，每 3 秒跑一遍是
+#             0.4%~2.2% CPU 且阻塞事件循环。对延迟最敏感的信号才配小值
 #
 # 只支持买入规则：卖出规则的契约是"持仓中调用"，实时侧没有持仓概念
 #
 # 注意：本表在服务启动时读取。改这里要重启服务；
 # reload_rules.bat 只重新加载 user_rules/ 里的规则**代码**并重新绑定，不重读本文件
 REALTIME_RULE_SIGNALS = [
+    # ---- 买入战法：收盘确认，与验证台回测逐根一致 ----
     {
         "key": "rt_kdj_rsi_30m",
         "rule": "kdj_rsi_golden",
         "period": "30m",
+        "confirm_on_close": True,
         "params": {},
         "enabled": True,
+    },
+    # ---- 盘中异动：判定末根（进行中），语义等同原来的快照策略 ----
+    # 日线末根在盘中会被实时快照刷新（见 Scanner._live_daily_bar），
+    # 所以这些规则拿到的是 3 秒新鲜的当日数据
+    {
+        "key": "limit_up", "rule": "limit_up", "period": "daily",
+        "confirm_on_close": False, "interval": 3,   # 涨停对延迟最敏感
+        "params": {}, "enabled": True,
+    },
+    {
+        "key": "strong_up", "rule": "strong_up", "period": "daily",
+        "confirm_on_close": False,                  # interval 默认 30
+        "params": {}, "enabled": True,
+    },
+    {
+        "key": "volume_breakout", "rule": "volume_breakout", "period": "daily",
+        "confirm_on_close": False,
+        "params": {}, "enabled": True,
+    },
+    {
+        "key": "rsi_oversold", "rule": "rsi_oversold", "period": "daily",
+        "confirm_on_close": False,
+        "params": {}, "enabled": True,
     },
 ]
 
