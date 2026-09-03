@@ -113,7 +113,8 @@ DEFAULT_PERIODS: Dict[str, dict] = {
         "mode": "live",
         "times": ["14:00"],
         "params": {"min_conditions": 4},   # 四条件全中(含低位≤35%)才推，去掉噪音
-        "top_n": 10,                        # 按建仓强度排序只推前10
+        "top_n": 10,                        # 按质量分排序只推前10
+        "min_mid_angle": 0.0,               # 中轨角度过滤：<0°(中轨向下)剔除
     },
     "30m": {
         "enabled": False,   # 预留：本期不实现
@@ -122,6 +123,7 @@ DEFAULT_PERIODS: Dict[str, dict] = {
         "times": ["10:00", "10:30", "11:30", "14:00", "14:30", "15:00"],
         "params": {},
         "top_n": 0,
+        "min_mid_angle": 0.0,
     },
 }
 
@@ -148,6 +150,9 @@ class Settings:
     scan_budget_sec: int = 120                # 有界扫描硬截止（秒）
     gather_concurrency: int = 10              # 数据抓取并发
     min_coverage: float = 0.6                 # 覆盖率兜底阈值，低于则推降级告警
+    # 质量分权重：quality = rank_angle_w*中轨角度 + rank_vol_w*(量比-1)
+    rank_angle_w: float = 1.0
+    rank_vol_w: float = 10.0
 
     # --- 作业 B：盘后更新 ---
     postclose_first: str = "15:40"            # 盘后首跑时刻
@@ -194,6 +199,8 @@ def load_settings() -> Settings:
     s.scan_budget_sec = _env_int("PUSH_SCAN_BUDGET_SEC", s.scan_budget_sec)
     s.gather_concurrency = _env_int("PUSH_GATHER_CONCURRENCY", s.gather_concurrency)
     s.min_coverage = _env_float("PUSH_MIN_COVERAGE", s.min_coverage)
+    s.rank_angle_w = _env_float("PUSH_RANK_ANGLE_W", s.rank_angle_w)
+    s.rank_vol_w = _env_float("PUSH_RANK_VOL_W", s.rank_vol_w)
 
     s.postclose_first = _env("PUSH_POSTCLOSE_FIRST", s.postclose_first).strip()
     s.postclose_retries = _env_list("PUSH_POSTCLOSE_RETRIES", s.postclose_retries)
@@ -216,6 +223,8 @@ def load_settings() -> Settings:
     if daily_params:
         s.periods["daily"]["params"] = daily_params
     s.periods["daily"]["top_n"] = _env_int("PUSH_DAILY_TOPN", s.periods["daily"]["top_n"])
+    s.periods["daily"]["min_mid_angle"] = _env_float(
+        "PUSH_DAILY_MIN_MID_ANGLE", s.periods["daily"]["min_mid_angle"])
 
     return s
 

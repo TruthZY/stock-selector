@@ -51,9 +51,11 @@ def build_message(result, scan_time: str = "14:00", top_n: int = 0) -> Tuple[str
             chg_s = f"{chg:+.2f}%" if isinstance(chg, (int, float)) else "—"
             price = m.get("price")
             price_s = f"{price:.2f}" if isinstance(price, (int, float)) else "—"
+            ang = m.get("mid_angle")
+            ang_s = f"中轨{ang:+.1f}°" if isinstance(ang, (int, float)) else "中轨—"
             lines.append(
                 f"**{idx}. {m.get('name','')}（{m.get('code','')}）** "
-                f"现价 {price_s} `{chg_s}`")
+                f"现价 {price_s} `{chg_s}` `{ang_s}`")
             lines.append(f"　{m.get('reason','')}")
             lines.append("")
     lines.append("---")

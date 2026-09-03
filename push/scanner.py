@@ -45,7 +45,9 @@ class PushScanner:
                  period: str = "daily", params: Optional[Dict] = None,
                  mode: str = "live", budget_sec: int = 120,
                  concurrency: int = 10, min_coverage: float = 0.6,
-                 min_bars: int = detector.DEFAULT_MIN_BARS):
+                 min_bars: int = detector.DEFAULT_MIN_BARS,
+                 min_mid_angle: Optional[float] = None,
+                 rank_angle_w: float = 1.0, rank_vol_w: float = 10.0):
         self.pool = list(pool)
         self.ds = ds
         self.cache = cache
@@ -57,6 +59,9 @@ class PushScanner:
         self.concurrency = concurrency
         self.min_coverage = min_coverage
         self.min_bars = min_bars
+        self.min_mid_angle = min_mid_angle
+        self.rank_angle_w = rank_angle_w
+        self.rank_vol_w = rank_vol_w
 
     async def scan(self) -> ScanResult:
         t0 = time.time()
@@ -100,7 +105,8 @@ class PushScanner:
             with_data += 1
             hit = detector.detect_one(code, names.get(code, code), bars, rule_cls,
                                       params=self.params, mode=self.mode,
-                                      min_bars=self.min_bars)
+                                      min_bars=self.min_bars,
+                                      min_mid_angle=self.min_mid_angle)
             if hit is not None:
                 # 附加快照里的实时涨跌幅，便于排序/展示
                 if snap:
@@ -109,10 +115,16 @@ class PushScanner:
                 matches.append(hit)
 
         coverage = (with_data / len(codes)) if codes else 0.0
-        # 建仓强度排序：命中条件数 desc → 量比 desc；同分按代码 asc（两趟稳定排序）
+        # 质量分：中轨角度(趋势) + 量比(资金)，均越高越好；角度缺失按极低处理
+        for m in matches:
+            a = m.get("mid_angle")
+            a = a if a is not None else -999.0
+            m["quality"] = (self.rank_angle_w * a
+                            + self.rank_vol_w * (m.get("vol_ratio", 0.0) - 1.0))
+        # 排序：命中条件数 desc → 质量分 desc；同分按代码 asc（两趟稳定排序）
         matches.sort(key=lambda m: str(m.get("code", "")))
-        matches.sort(key=lambda m: (m.get("n_conditions", 0),
-                                    m.get("vol_ratio", 0.0)), reverse=True)
+        matches.sort(key=lambda m: (m.get("n_conditions", 0), m.get("quality", 0.0)),
+                     reverse=True)
         elapsed = int((time.time() - t0) * 1000)
         return ScanResult(
             ok=True, period=self.period, rule=self.rule_key, date=today,

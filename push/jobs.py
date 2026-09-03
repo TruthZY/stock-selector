@@ -40,6 +40,7 @@ async def job_scan_push(settings: Settings, period: str = "daily",
     mode = pcfg.get("mode", "live")
     rule_params = pcfg.get("params") or {}
     eff_top_n = top_n or int(pcfg.get("top_n", 0) or 0)
+    min_mid_angle = pcfg.get("min_mid_angle", None)
 
     from app.store import Store
     from app.datasource import DataSource
@@ -68,6 +69,8 @@ async def job_scan_push(settings: Settings, period: str = "daily",
             pool, ds, cache, rule_key=rule_key, period=period, mode=mode,
             params=rule_params, budget_sec=settings.scan_budget_sec,
             concurrency=settings.gather_concurrency, min_coverage=settings.min_coverage,
+            min_mid_angle=min_mid_angle,
+            rank_angle_w=settings.rank_angle_w, rank_vol_w=settings.rank_vol_w,
         )
         result = await scanner.scan()
     finally:

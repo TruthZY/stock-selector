@@ -171,9 +171,11 @@ def main(argv=None) -> int:
             for i, m in enumerate(result.matches, 1):
                 chg = m.get("change_pct")
                 chg_s = f"{chg:+.2f}%" if isinstance(chg, (int, float)) else "—"
+                ang = m.get("mid_angle")
+                ang_s = f"中轨{ang:+.1f}°" if isinstance(ang, (int, float)) else "中轨—"
                 print(f"{i:2}. {m.get('name','')}({m.get('code','')}) "
                       f"现价{m.get('price') if m.get('price') is not None else '—'} "
-                      f"{chg_s}  {m.get('reason','')}")
+                      f"{chg_s} {ang_s}  {m.get('reason','')}")
         else:
             print("（无命中）")
         return 0 if result.ok else 1

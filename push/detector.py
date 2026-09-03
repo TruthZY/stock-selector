@@ -11,6 +11,7 @@
 """
 from __future__ import annotations
 
+import math
 import re
 from typing import Dict, List, Optional
 
@@ -19,6 +20,21 @@ DEFAULT_MIN_BARS = 60
 
 # 从买入战法 reason 文本里解析"量比X.X"
 _VOL_RE = re.compile(r"量比\s*([0-9]+(?:\.[0-9]+)?)")
+
+
+def _mid_angle(bars: List[dict], i: int, n: int = 20) -> Optional[float]:
+    """布林中轨(MA n)在 bar i 处的角度（度），通达信口径：
+        angle = ATAN((mid[i]/mid[i-1] - 1) * 100) * 180/π
+    以百分比作正切，跨价位股票可比。数据不足(i<n)或前值非正时返回 None。
+    """
+    if i < n or n <= 0:
+        return None
+    closes = [b["close"] for b in bars]
+    mid_i = sum(closes[i - n + 1:i + 1]) / n
+    mid_p = sum(closes[i - n:i]) / n
+    if mid_p <= 0:
+        return None
+    return math.degrees(math.atan((mid_i / mid_p - 1.0) * 100.0))
 
 
 def _parse_strength(reason: str) -> tuple:
@@ -75,10 +91,14 @@ def _resolve_index(bars: List[dict], mode: str) -> Optional[int]:
 
 def detect_one(code: str, name: str, bars: Optional[List[dict]], rule_cls,
                params: Optional[Dict] = None, mode: str = "live",
-               min_bars: int = DEFAULT_MIN_BARS) -> Optional[dict]:
+               min_bars: int = DEFAULT_MIN_BARS,
+               min_mid_angle: Optional[float] = None) -> Optional[dict]:
     """对单只股票跑一次买入战法，命中返回 hit dict，否则 None。
 
-    hit: {code, name, reason, ts, price(close of判定bar), i}
+    min_mid_angle 非空时加一道趋势过滤：布林中轨角度 < 阈值（或算不出）则丢弃，
+    用于剔除中轨走平/向下的票（阈值 0 = 只要中轨不向下）。
+
+    hit: {code, name, reason, ts, price, i, n_conditions, vol_ratio, mid_angle}
     """
     if not bars or len(bars) < min_bars:
         return None
@@ -100,19 +120,27 @@ def detect_one(code: str, name: str, bars: Optional[List[dict]], rule_cls,
     bar = bars[i]
     reason = getattr(sig, "reason", "") or ""
     n_cond, vol_ratio = _parse_strength(reason)
+    # 中轨角度（趋势质量）+ 过滤门
+    boll_n = int(rule.params.get("boll_n", 20) or 20)
+    mid_angle = _mid_angle(bars, i, boll_n)
+    if min_mid_angle is not None and (mid_angle is None or mid_angle < min_mid_angle):
+        return None
     return {"code": code, "name": name or code,
             "reason": reason, "ts": bar.get("ts", ""),
             "price": bar.get("close"), "i": i,
-            "n_conditions": n_cond, "vol_ratio": vol_ratio}
+            "n_conditions": n_cond, "vol_ratio": vol_ratio,
+            "mid_angle": mid_angle}
 
 
 def detect_many(items: List[dict], rule_cls, params: Optional[Dict] = None,
-                mode: str = "live", min_bars: int = DEFAULT_MIN_BARS) -> List[dict]:
+                mode: str = "live", min_bars: int = DEFAULT_MIN_BARS,
+                min_mid_angle: Optional[float] = None) -> List[dict]:
     """对多只股票批量检测。items: [{code,name,bars}]，返回命中清单。"""
     hits: List[dict] = []
     for it in items:
         h = detect_one(it.get("code", ""), it.get("name", ""), it.get("bars"),
-                       rule_cls, params=params, mode=mode, min_bars=min_bars)
+                       rule_cls, params=params, mode=mode, min_bars=min_bars,
+                       min_mid_angle=min_mid_angle)
         if h is not None:
             hits.append(h)
     return hits

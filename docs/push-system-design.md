@@ -102,9 +102,12 @@ docs/
   ├─ 3. 逐股装配 bars：kline_cache 取历史(≥200) + Scanner._live_daily_bar(snap) 合成当日盘中日K，
   │      追加/替换末根（仅内存视图，绝不写回 kline_cache）
   ├─ 4. 逐股跑 accumulation_detect（每股独立实例：reset→params→prepare→on_bar，i=末根=今日进行中）
+  │      → 中轨角度过滤：算 BOLL 中轨(MA20)角度 ATAN((mid/REF(mid)-1)*100)*180/π，
+  │        < min_mid_angle(默认0°) 剔除（去掉中轨走平/向下的票）
   ├─ 5. 覆盖率兜底：数据齐全占比 < min_coverage(0.6) → 判数据异常，改推「降级告警」而非误报「无信号」
-  ├─ 6. 收集命中 → 按 (date, period) 去重（当日只推一次）→ 按建仓强度排序
-  │      （命中条件数 desc → 量比 desc，同分代码 asc）；默认 min_conditions=4、只推前 10
+  ├─ 6. 收集命中 → 按 (date, period) 去重（当日只推一次）→ 按质量分排序
+  │      quality = rank_angle_w*中轨角度 + rank_vol_w*(量比-1)；主键命中条件数 desc → quality desc → 代码 asc
+  │      默认 min_conditions=4、min_mid_angle=0、只推前 10
   ├─ 7. formatter 合并成一条钉钉 markdown（标题标注「日K · 盘中预估 14:00 · 未收盘」）
   ├─ 8. DingTalkPusher.send()：加签 + POST，失败重试 3 次退避；结果写 state
   └─ 9. 销毁 PushScanner、bars、rule 实例、快照 dict（出作用域 + 可选 gc.collect()），内存回落基线
@@ -220,7 +223,7 @@ docs/
 | P6 联调 | 连续 3~5 个交易日观察 14:00 自动推送、盘后更新、假日跳过、重启幂等、断网重试 | 稳定无人工干预 |
 | P7 预留 | 开启 30m（多时刻 + 收盘确认 + 每根去重）、其他渠道（webhook/邮件）、多规则、收盘确认二次推送、全量 rebase 维护 | 仅改配置即可上线 30m |
 
-**配置项（`push/settings.py`）**：`scan_budget_sec=120`、`gather_concurrency=10`、`min_coverage=0.6`、`postclose_first="15:40"`、`postclose_retries=["16:40","18:00","20:00"]`、`periods={"daily":{"enabled":True,"rule":"accumulation_detect","mode":"live","times":["14:00"],"params":{"min_conditions":4},"top_n":10},"30m":{"enabled":False,...}}`。env 覆盖：`PUSH_DAILY_PARAMS="min_conditions=4"`、`PUSH_DAILY_TOPN=10`、`PUSH_DAILY_TIMES`、`PUSH_ENABLE_30M` 等。密钥从环境变量读：`DINGTALK_WEBHOOK` + 二选一 `DINGTALK_SECRET`（加签）或 `DINGTALK_KEYWORD`（关键词模式）。
+**配置项（`push/settings.py`）**：`scan_budget_sec=120`、`gather_concurrency=10`、`min_coverage=0.6`、`rank_angle_w=1.0`、`rank_vol_w=10.0`、`postclose_first="15:40"`、`postclose_retries=["16:40","18:00","20:00"]`、`periods={"daily":{"enabled":True,"rule":"accumulation_detect","mode":"live","times":["14:00"],"params":{"min_conditions":4},"top_n":10,"min_mid_angle":0},"30m":{"enabled":False,...}}`。env 覆盖：`PUSH_DAILY_PARAMS="min_conditions=4"`、`PUSH_DAILY_TOPN=10`、`PUSH_DAILY_MIN_MID_ANGLE=0`、`PUSH_RANK_ANGLE_W`、`PUSH_RANK_VOL_W`、`PUSH_DAILY_TIMES`、`PUSH_ENABLE_30M` 等。密钥从环境变量读：`DINGTALK_WEBHOOK` + 二选一 `DINGTALK_SECRET`（加签）或 `DINGTALK_KEYWORD`（关键词模式）。
 
 ---
 
