@@ -128,8 +128,8 @@ def main(argv=None) -> int:
     g = parser.add_mutually_exclusive_group(required=True)
     g.add_argument("--test-push", action="store_true", help="发一条测试消息验证渠道")
     g.add_argument("--once", action="store_true", help="手动跑一次盘中扫描推送（作业A）")
-    g.add_argument("--update", action="store_true", help="[P3] 手动跑一次盘后数据更新（作业B）")
-    g.add_argument("--daemon", action="store_true", help="[P3] 常驻调度器")
+    g.add_argument("--update", action="store_true", help="手动跑一次盘后数据更新（作业B）")
+    g.add_argument("--daemon", action="store_true", help="常驻调度器（自动按点触发作业A/B）")
     g.add_argument("--show-config", action="store_true", help="打印当前配置状态后退出")
     parser.add_argument("--period", default="daily", help="周期（daily/30m），默认 daily")
     parser.add_argument("--dry-run", action="store_true", help="只组装打印、不真正发送")
@@ -189,6 +189,7 @@ def main(argv=None) -> int:
         return 0 if res.get("status") in ("ok", "skip") else 1
     if args.daemon:
         import logging
+        import signal
         from push.state import State
         from push.scheduler import Scheduler
         log = logging.getLogger("push")
@@ -196,12 +197,23 @@ def main(argv=None) -> int:
         sched = Scheduler(s, state, log, tick_sec=args.tick)
         print(f"推送调度器已启动（tick={args.tick}s，state={s.state_dir}）")
         print(f"作业槽位：{sched.slots()}")
-        print("按 Ctrl+C 停止")
+        print("按 Ctrl+C 或 systemctl stop 停止")
+
+        async def _run():
+            loop = asyncio.get_running_loop()
+            # systemd stop 发 SIGTERM → 优雅停止；Windows 不支持则退回 KeyboardInterrupt
+            for sig in (signal.SIGTERM, signal.SIGINT):
+                try:
+                    loop.add_signal_handler(sig, sched.stop)
+                except (NotImplementedError, RuntimeError, AttributeError):
+                    pass
+            await sched.run_forever()
+
         try:
-            asyncio.run(sched.run_forever())
+            asyncio.run(_run())
         except KeyboardInterrupt:
             sched.stop()
-            print("\n收到中断，调度器已停止")
+        print("调度器已停止")
         return 0
     parser.print_help()
     return 0

@@ -1,0 +1,57 @@
+# 股票推送系统 systemd 服务单元（裸机部署，非 Docker）
+#
+# 安装：
+#   sudo cp deploy/push.service /etc/systemd/system/push.service
+#   # 若下面路径与实际不同，改 WorkingDirectory / ExecStart / EnvironmentFile / ReadWritePaths
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now push.service
+# 查看：
+#   systemctl status push          # 运行状态
+#   journalctl -u push -f          # 实时日志
+#
+# 前置：已按 deploy/DEPLOY.md 建好 stockpush 用户、venv、种子数据、deploy/push.env
+
+[Unit]
+Description=Stock Signal Push Service (股票推送系统 - 常驻调度器)
+Documentation=file:/opt/stock-selector/docs/push-system-design.md
+# 等网络就绪再起（要访问行情源与钉钉）
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# 非 root 专用用户运行（见 DEPLOY.md 创建步骤）
+User=stockpush
+Group=stockpush
+WorkingDirectory=/opt/stock-selector
+
+# 密钥/配置：只从这个文件读环境变量（chmod 600，永不入 git/镜像）
+EnvironmentFile=/opt/stock-selector/deploy/push.env
+# 时区必须是上海，否则 14:00 会按 UTC 错位触发（阿里云 Ubuntu 常默认 UTC）
+Environment=TZ=Asia/Shanghai
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONIOENCODING=utf-8
+
+# 常驻调度器：睡到点唤醒作业A(14:00扫描推送)/作业B(盘后更新)
+ExecStart=/opt/stock-selector/venv/bin/python -m push --daemon
+
+# 崩溃自动拉起；正常 systemctl stop 不重启
+Restart=always
+RestartSec=10
+
+# --- 安全加固 ---
+NoNewPrivileges=true
+# 整个文件系统只读，仅项目目录可写（kline.db / push/state / push/logs）
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+ReadWritePaths=/opt/stock-selector
+# 本服务只发出站请求（行情源 + oapi.dingtalk.com），无需任何入站端口，
+# 因此不监听端口；防火墙只需放行 SSH（见 DEPLOY.md）。
+
+[Install]
+WantedBy=multi-user.target
