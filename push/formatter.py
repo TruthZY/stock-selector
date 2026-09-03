@@ -103,7 +103,9 @@ def build_postclose_message(result, scan_time: str = "21:00", top_n: int = 0,
             cnt_part = f"　`{cnt_s}`" if cnt_s else ""
             lines.append(
                 f"**{idx}. {m.get('name','')}（{m.get('code','')}）**{cnt_part}")
-    lines.append("")
+            # 钉钉 markdown 会把无空行的连续单行合并成一段渲染，
+            # 每条之间必须空一行才能"一排一排"分开显示（与盘前 build_message 一致）
+            lines.append("")
     lines.append("---")
     lines.append(f"_盘后收盘数据；次数=近{window_days}个扫描日命中回数，仅供参考，不构成投资建议_")
     return title, "\n".join(lines)
