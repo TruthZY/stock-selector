@@ -210,7 +210,8 @@ SINA_KLINE_URL = "https://quotes.sina.cn/cn/api/json_v2.php/CN_MarketDataService
 
 
 class SinaKline:
-    """新浪K线：仅提供日K（scale=240）备用，不复权"""
+    """新浪K线：仅提供日K（scale=240）备用，不复权
+    volume 单位为股，统一换算为手（/100）与全系统口径一致"""
 
     @staticmethod
     async def fetch_kline(
@@ -246,7 +247,9 @@ class SinaKline:
                     "close": float(row["close"]),
                     "high": float(row["high"]),
                     "low": float(row["low"]),
-                    "volume": float(row["volume"]),
+                    # 新浪日K volume 单位为股，换算为手（/100）与全系统口径一致
+                    # （缓存/腾讯ifzq/东财/BaoStock 均为手；实测新浪恰为腾讯的100倍）
+                    "volume": float(row["volume"]) / 100.0,
                     "amount": 0.0,
                 })
             except (ValueError, KeyError, TypeError):
