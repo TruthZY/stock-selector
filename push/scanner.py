@@ -47,7 +47,8 @@ class PushScanner:
                  concurrency: int = 10, min_coverage: float = 0.6,
                  min_bars: int = detector.DEFAULT_MIN_BARS,
                  min_mid_angle: Optional[float] = None,
-                 rank_angle_w: float = 1.0, rank_vol_w: float = 10.0):
+                 rank_angle_w: float = 1.0, rank_vol_w: float = 10.0,
+                 source: str = "live"):
         self.pool = list(pool)
         self.ds = ds
         self.cache = cache
@@ -62,6 +63,8 @@ class PushScanner:
         self.min_mid_angle = min_mid_angle
         self.rank_angle_w = rank_angle_w
         self.rank_vol_w = rank_vol_w
+        # source: "live"=拉实时快照合成当日bar(盘中) / "cache"=只用缓存收盘bar(盘后)
+        self.source = source
 
     async def scan(self) -> ScanResult:
         t0 = time.time()
@@ -79,12 +82,22 @@ class PushScanner:
         if not codes:
             return ScanResult(False, self.period, self.rule_key, today, msg="股票池为空")
 
-        # 1. 快照（分批，带 deadline）
-        snaps = await datafeed.fetch_snapshots(self.ds, codes, deadline=deadline)
-        # 2. 历史（并发，带 deadline；优先缓存）
-        hists = await datafeed.load_histories(
-            self.ds, self.cache, codes, self.period,
-            deadline=deadline, concurrency=self.concurrency)
+        # 1&2. 取数：盘中=实时快照+历史；盘后=只读缓存收盘bar（不联网）
+        snaps: Dict[str, dict] = {}
+        if self.source == "cache":
+            hists = {}
+            for code in codes:
+                try:
+                    h = self.cache.get_all(code, self.period)
+                except Exception:
+                    h = None
+                if h:
+                    hists[code] = h
+        else:
+            snaps = await datafeed.fetch_snapshots(self.ds, codes, deadline=deadline)
+            hists = await datafeed.load_histories(
+                self.ds, self.cache, codes, self.period,
+                deadline=deadline, concurrency=self.concurrency)
 
         # 3. 逐股装配 + 检测
         matches: List[dict] = []
@@ -93,13 +106,16 @@ class PushScanner:
         for code in codes:
             hist = hists.get(code)
             snap = snaps.get(code)
-            bars = datafeed.build_bars(hist, snap, self.period)
-            # 数据齐全度：daily 需历史 + 今日快照合成成功（bars 末根是今日）
+            if self.source == "cache":
+                bars = datafeed.build_bars_close(hist, self.period, today)
+            else:
+                bars = datafeed.build_bars(hist, snap, self.period)
+            # 数据齐全度：daily 需今日那根在位（盘中来自快照合成，盘后来自缓存收盘bar）
             if len(bars) < self.min_bars:
                 skipped += 1
                 continue
             if self.period == "daily" and (not bars or bars[-1]["ts"][:10] != today):
-                # 没拿到今日快照 → 当日bar缺失，跳过（不计入 with_data）
+                # 当日bar缺失（盘中没拿到快照 / 盘后作业B尚未落库）→ 跳过
                 skipped += 1
                 continue
             with_data += 1
@@ -108,8 +124,13 @@ class PushScanner:
                                       min_bars=self.min_bars,
                                       min_mid_angle=self.min_mid_angle)
             if hit is not None:
-                # 附加快照里的实时涨跌幅，便于排序/展示
-                if snap:
+                if self.source == "cache":
+                    # 盘后：价格/涨跌幅取自缓存收盘bar（今收 vs 昨收）
+                    hit["price"] = bars[-1].get("close")
+                    if len(bars) >= 2 and bars[-2].get("close"):
+                        hit["change_pct"] = (bars[-1]["close"] / bars[-2]["close"] - 1) * 100
+                elif snap:
+                    # 盘中：附加快照里的实时涨跌幅，便于排序/展示
                     hit["change_pct"] = snap.get("change_pct")
                     hit["price"] = snap.get("price") or hit.get("price")
                 matches.append(hit)

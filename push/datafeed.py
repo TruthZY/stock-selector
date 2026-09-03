@@ -94,6 +94,18 @@ def build_bars(hist: Optional[List[dict]], snap: Optional[dict],
     return bars
 
 
+def build_bars_close(hist: Optional[List[dict]], period: str = "daily",
+                     today: Optional[str] = None) -> List[dict]:
+    """盘后装配：直接用缓存历史（作业B已把今日**收盘**bar落库），截断到 <= today。
+
+    与 build_bars 的区别：不拉实时快照、不合成当日bar——今日那根就是缓存里的官方
+    收盘bar。用于 21:00 盘后扫描（"只用盘后数据不用实时数据"）。
+    """
+    hist = hist or []
+    today = today or today_str()
+    return [b for b in hist if b.get("ts", "")[:10] <= today]
+
+
 # ---------------------------------------------------------------------------
 # 批量快照 & 历史加载（都带 deadline，超时即止）
 # ---------------------------------------------------------------------------

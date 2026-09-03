@@ -22,7 +22,17 @@ def _mode_label(mode: str, scan_time: str) -> str:
     return f"盘中预估 {scan_time}（未收盘）"
 
 
-def build_message(result, scan_time: str = "14:00", top_n: int = 0) -> Tuple[str, str]:
+def _counts_tag(m: dict, window_days: int = 10) -> str:
+    """近N个扫描日的盘前/盘后命中次数标注；未注入次数时返回空串（向后兼容）。"""
+    cp = m.get("cnt_pre")
+    cs = m.get("cnt_post")
+    if cp is None and cs is None:
+        return ""
+    return f"近{window_days}日 盘前{cp or 0}·盘后{cs or 0}"
+
+
+def build_message(result, scan_time: str = "14:00", top_n: int = 0,
+                  window_days: int = 10) -> Tuple[str, str]:
     """把 ScanResult 合并成 (title, markdown)。top_n>0 时只取前 N 只。"""
     plabel = period_label(result.period)
     mlabel = _mode_label("live" if result.period == "daily" else "close", scan_time)
@@ -53,13 +63,49 @@ def build_message(result, scan_time: str = "14:00", top_n: int = 0) -> Tuple[str
             price_s = f"{price:.2f}" if isinstance(price, (int, float)) else "—"
             ang = m.get("mid_angle")
             ang_s = f"中轨{ang:+.1f}°" if isinstance(ang, (int, float)) else "中轨—"
+            cnt_s = _counts_tag(m, window_days)
+            cnt_part = f" `{cnt_s}`" if cnt_s else ""
             lines.append(
                 f"**{idx}. {m.get('name','')}（{m.get('code','')}）** "
-                f"现价 {price_s} `{chg_s}` `{ang_s}`")
+                f"现价 {price_s} `{chg_s}` `{ang_s}`{cnt_part}")
             lines.append(f"　{m.get('reason','')}")
             lines.append("")
     lines.append("---")
     lines.append("_盘中预估，尾盘可能变化，仅供参考，不构成投资建议_")
+    return title, "\n".join(lines)
+
+
+def build_postclose_message(result, scan_time: str = "21:00", top_n: int = 0,
+                            window_days: int = 10) -> Tuple[str, str]:
+    """盘后推送（精简版）：只列 排名 + 名称 + 代码 + 近N日盘前/盘后命中次数。
+    不含现价/涨跌幅/中轨角度/建仓信号明细（按需求"不推送详细数据"）。"""
+    plabel = period_label(result.period)
+    matches: List[dict] = list(result.matches)
+    total = len(matches)
+    if top_n > 0:
+        matches = matches[:top_n]
+    shown = len(matches)
+
+    title = f"建仓信号推送 · {plabel} · 盘后"
+    count_s = (f"命中 **{total}** 只，展示前 {shown} 只"
+               if shown < total else f"命中 **{shown}** 只")
+    lines = [
+        f"### 🌙 建仓信号推送 · {plabel} · 盘后收盘确认 {scan_time}",
+        "",
+        f"> {count_s} / 参与判定 {result.with_data} 只 · {result.date}",
+        "",
+    ]
+    if not matches:
+        lines.append("_今日盘后无命中信号_")
+    else:
+        for idx, m in enumerate(matches, 1):
+            cnt_s = _counts_tag(m, window_days)
+            cnt_part = f"　`{cnt_s}`" if cnt_s else ""
+            lines.append(
+                f"**{idx}. {m.get('name','')}（{m.get('code','')}）**{cnt_part}")
+    lines.append("")
+    lines.append("---")
+    lines.append(f"_盘后收盘数据；次数=近{window_days}个扫描日命中回数，仅供参考，不构成投资建议_")
     return title, "\n".join(lines)
 
 

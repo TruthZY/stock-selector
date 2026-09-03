@@ -75,6 +75,9 @@ def _print_config_status(s) -> None:
     print(f"  盘中扫描超时预算  : {s.scan_budget_sec}s")
     print(f"  覆盖率兜底阈值    : {s.min_coverage}")
     print(f"  盘后首跑/重试     : {s.postclose_first} / {s.postclose_retries}")
+    print(f"  盘后扫描推送      : {'开 ' + s.postclose_scan_time if s.postclose_scan_enabled else '关'}"
+          f"（top_n={s.postclose_scan_top_n or s.periods['daily'].get('top_n')}，只用收盘缓存）")
+    print(f"  命中滑动窗口      : 近{s.hit_window_days}个扫描日（保留{s.hit_keep_dates}日）")
     print(f"  重试次数/退避基数 : {s.push_max_retries} / {s.push_retry_backoff}s")
     print(f"  日志级别/目录     : {s.log_level} / {s.log_dir}")
 
@@ -128,6 +131,8 @@ def main(argv=None) -> int:
     g = parser.add_mutually_exclusive_group(required=True)
     g.add_argument("--test-push", action="store_true", help="发一条测试消息验证渠道")
     g.add_argument("--once", action="store_true", help="手动跑一次盘中扫描推送（作业A）")
+    g.add_argument("--once-close", action="store_true",
+                   help="手动跑一次盘后扫描推送（作业C，只用收盘缓存数据）")
     g.add_argument("--update", action="store_true", help="手动跑一次盘后数据更新（作业B）")
     g.add_argument("--daemon", action="store_true", help="常驻调度器（自动按点触发作业A/B）")
     g.add_argument("--show-config", action="store_true", help="打印当前配置状态后退出")
@@ -189,6 +194,27 @@ def main(argv=None) -> int:
         print("=== 作业B[盘后更新] 结果 ===")
         print(res)
         return 0 if res.get("status") in ("ok", "skip") else 1
+    if args.once_close:
+        import logging
+        from push.jobs import job_scan_postclose
+        log = logging.getLogger("push")
+        result = asyncio.run(job_scan_postclose(
+            s, period=args.period, dry_run=args.dry_run,
+            push=not args.no_push, top_n=args.top_n, logger=log))
+        print()
+        print(f"=== 作业C[{args.period}] 盘后命中清单 ===")
+        print(result.msg or "（无消息）")
+        if result.was_skipped:
+            print(f"（跳过：{result.skip_reason}）")
+        elif result.matches:
+            w = s.hit_window_days
+            shown = result.matches[:args.top_n] if args.top_n > 0 else result.matches
+            for i, m in enumerate(shown, 1):
+                print(f"{i:2}. {m.get('name','')}({m.get('code','')}) "
+                      f"近{w}日 盘前{m.get('cnt_pre',0)}·盘后{m.get('cnt_post',0)}")
+        else:
+            print("（无命中）")
+        return 0 if result.ok else 1
     if args.daemon:
         import logging
         import signal

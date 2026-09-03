@@ -46,9 +46,12 @@ class Scheduler:
             if not cfg.get("enabled"):
                 continue
             for t in cfg.get("times", []):
-                out.append((t, "scan", period))          # 作业A
+                out.append((t, "scan", period))          # 作业A：盘中实时扫描
             for t in ladder:
-                out.append((t, "update", period))        # 作业B
+                out.append((t, "update", period))        # 作业B：盘后数据更新
+            # 作业C：盘后扫描推送（只用收盘缓存），须排在作业B末次之后
+            if period == "daily" and self.s.postclose_scan_enabled:
+                out.append((self.s.postclose_scan_time, "scan_close", period))
         return sorted(out, key=lambda x: x[0])
 
     @staticmethod
@@ -67,16 +70,16 @@ class Scheduler:
             slot_dt = self._slot_dt(hhmm, day0)
             if now < slot_dt:
                 continue                  # 未到点
-            window = SCAN_WINDOW_MIN if job == "scan" else UPDATE_WINDOW_MIN
+            window = SCAN_WINDOW_MIN if job in ("scan", "scan_close") else UPDATE_WINDOW_MIN
             if now > slot_dt + timedelta(minutes=window):
                 continue                  # 超出触发窗口，等明天
             await self._maybe_run(job, period, hhmm, date_str)
 
     async def _maybe_run(self, job: str, period: str, slot: str, date_str: str) -> None:
         # 幂等门禁
-        if job == "scan":
+        if job in ("scan", "scan_close"):
             # 每槽只跑一次（ok/fail/skip 都算跑过），避免失败后每 tick 重跑刷屏
-            if self.state.is_done("scan", date_str, period, slot=slot, status=None):
+            if self.state.is_done(job, date_str, period, slot=slot, status=None):
                 return
         else:
             # 今日已成功 → 跳过后续阶梯；本槽已尝试过 → 等下一个阶梯时刻
@@ -89,6 +92,8 @@ class Scheduler:
         try:
             if job == "scan":
                 await self._run_scan(period, slot, date_str)
+            elif job == "scan_close":
+                await self._run_scan_close(period, slot, date_str)
             else:
                 await self._run_update(period, slot, date_str)
         except Exception as e:
@@ -110,6 +115,21 @@ class Scheduler:
                             elapsed_ms=res.elapsed_ms, detail=res.msg)
         else:
             self.state.mark("scan", date_str, period, slot, "fail",
+                            coverage=res.coverage, elapsed_ms=res.elapsed_ms,
+                            detail=res.msg)
+
+    async def _run_scan_close(self, period: str, slot: str, date_str: str) -> None:
+        res = await jobs.job_scan_postclose(
+            self.s, period=period, push=True, scan_time=slot, logger=self.log)
+        if res.was_skipped:
+            self.state.mark("scan_close", date_str, period, slot, "skip",
+                            detail=res.skip_reason)
+        elif res.ok and not res.degraded:
+            self.state.mark("scan_close", date_str, period, slot, "ok",
+                            matches=len(res.matches), coverage=res.coverage,
+                            elapsed_ms=res.elapsed_ms, detail=res.msg)
+        else:
+            self.state.mark("scan_close", date_str, period, slot, "fail",
                             coverage=res.coverage, elapsed_ms=res.elapsed_ms,
                             detail=res.msg)
 

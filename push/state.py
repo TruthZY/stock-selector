@@ -36,6 +36,22 @@ CREATE TABLE IF NOT EXISTS runs (
     PRIMARY KEY (job, date, period, slot)
 );
 CREATE INDEX IF NOT EXISTS idx_runs_date ON runs(date, job);
+
+-- 命中滑动记录：每次扫描(盘前 pre / 盘后 post)命中的股票逐日留痕，
+-- 用于统计"近 N 个扫描日内某股被盘前/盘后各命中几次"。
+CREATE TABLE IF NOT EXISTS hits (
+    session  TEXT NOT NULL,          -- pre=盘前(14:00实时) / post=盘后(21:00收盘)
+    date     TEXT NOT NULL,          -- YYYY-MM-DD 交易日
+    period   TEXT NOT NULL,          -- daily/30m...
+    code     TEXT NOT NULL,
+    name     TEXT DEFAULT '',
+    rank     INTEGER DEFAULT 0,      -- 当次质量排名(1起)
+    n_conditions INTEGER DEFAULT 0,
+    quality  REAL DEFAULT 0,
+    ts       TEXT NOT NULL,
+    PRIMARY KEY (session, date, period, code)
+);
+CREATE INDEX IF NOT EXISTS idx_hits_session_date ON hits(session, period, date);
 """
 
 
@@ -109,3 +125,83 @@ class State:
         return [{"job": r[0], "date": r[1], "period": r[2], "slot": r[3],
                  "status": r[4], "matches": r[5], "coverage": r[6],
                  "elapsed_ms": r[7], "detail": r[8], "ts": r[9]} for r in rows]
+
+    # --- 命中滑动记录（盘前 pre / 盘后 post）---
+    def record_hits(self, session: str, date: str, period: str,
+                    matches: List[dict]) -> None:
+        """记录一次扫描的全部命中到滑动记录。
+
+        同日同 session 覆盖（先删后插）→ 幂等：手动重跑/补跑不会重复累加。
+        记录的是"扫中的全部"（result.matches 完整清单），不是只记 top_n。
+        """
+        now = time.strftime("%Y-%m-%d %H:%M:%S")
+        with self._lock:
+            conn = self._connect()
+            try:
+                conn.execute("DELETE FROM hits WHERE session=? AND date=? AND period=?",
+                             (session, date, period))
+                for rank, m in enumerate(matches, 1):
+                    conn.execute(
+                        "INSERT OR REPLACE INTO hits"
+                        "(session,date,period,code,name,rank,n_conditions,quality,ts) "
+                        "VALUES(?,?,?,?,?,?,?,?,?)",
+                        (session, date, period, str(m.get("code", "")),
+                         str(m.get("name", "")), rank,
+                         int(m.get("n_conditions", 0) or 0),
+                         float(m.get("quality", 0.0) or 0.0), now))
+                conn.commit()
+            finally:
+                conn.close()
+
+    def hit_counts(self, session: str, period: str, codes: List[str],
+                   window_days: int = 10) -> dict:
+        """近 window_days 个"扫描日"内每只 code 的命中次数。
+
+        窗口按该 session 最近 N 个**有记录的交易日**算（自然跳过周末/节假日），
+        而非 N 个自然日——这样"10天"= 最近10次扫描，语义更贴合盘感。
+        返回 {code: count}，未命中的 code 计 0。
+        """
+        codes = [str(c) for c in codes]
+        if not codes:
+            return {}
+        with self._lock:
+            conn = self._connect()
+            try:
+                dates = [r[0] for r in conn.execute(
+                    "SELECT DISTINCT date FROM hits WHERE session=? AND period=? "
+                    "ORDER BY date DESC LIMIT ?",
+                    (session, period, int(window_days))).fetchall()]
+                if not dates:
+                    return {c: 0 for c in codes}
+                marks = ",".join("?" * len(dates))
+                rows = conn.execute(
+                    f"SELECT code, COUNT(*) FROM hits WHERE session=? AND period=? "
+                    f"AND date IN ({marks}) GROUP BY code",
+                    [session, period, *dates]).fetchall()
+            finally:
+                conn.close()
+        cnt = {r[0]: int(r[1]) for r in rows}
+        return {c: cnt.get(c, 0) for c in codes}
+
+    def prune_hits(self, keep_dates: int = 40) -> None:
+        """滑动修剪：每个 (session,period) 只保留最近 keep_dates 个交易日的记录，
+        防止 hits 表无限增长。keep_dates 应 > window_days。"""
+        with self._lock:
+            conn = self._connect()
+            try:
+                pairs = conn.execute(
+                    "SELECT DISTINCT session, period FROM hits").fetchall()
+                for session, period in pairs:
+                    keep = [r[0] for r in conn.execute(
+                        "SELECT DISTINCT date FROM hits WHERE session=? AND period=? "
+                        "ORDER BY date DESC LIMIT ?",
+                        (session, period, int(keep_dates))).fetchall()]
+                    if not keep:
+                        continue
+                    cutoff = min(keep)
+                    conn.execute(
+                        "DELETE FROM hits WHERE session=? AND period=? AND date < ?",
+                        (session, period, cutoff))
+                conn.commit()
+            finally:
+                conn.close()

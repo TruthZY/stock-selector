@@ -159,6 +159,15 @@ class Settings:
     postclose_retries: List[str] = field(
         default_factory=lambda: ["16:40", "18:00", "20:00"])
 
+    # --- 作业 C：盘后扫描推送（21:00，只用收盘缓存数据，不碰实时快照）---
+    postclose_scan_enabled: bool = True       # 是否启用盘后扫描推送
+    postclose_scan_time: str = "21:00"        # 盘后扫描触发时刻（须在作业B末次20:00之后）
+    postclose_scan_top_n: int = 0             # 盘后推送取前N只（0=沿用该周期 top_n）
+
+    # --- 命中滑动记录 ---
+    hit_window_days: int = 10                 # "近N天命中次数"窗口（按扫描日计，非自然日）
+    hit_keep_dates: int = 40                  # hits 表滑动修剪：每 session 只留最近N个交易日
+
     # --- 周期 ---
     periods: Dict[str, dict] = field(default_factory=lambda: dict(DEFAULT_PERIODS))
 
@@ -204,6 +213,17 @@ def load_settings() -> Settings:
 
     s.postclose_first = _env("PUSH_POSTCLOSE_FIRST", s.postclose_first).strip()
     s.postclose_retries = _env_list("PUSH_POSTCLOSE_RETRIES", s.postclose_retries)
+
+    # 作业C：盘后扫描推送（21:00，只用收盘缓存数据）
+    s.postclose_scan_enabled = _env_bool(
+        "PUSH_ENABLE_POSTCLOSE_SCAN", s.postclose_scan_enabled)
+    s.postclose_scan_time = _env(
+        "PUSH_POSTCLOSE_SCAN_TIME", s.postclose_scan_time).strip()
+    s.postclose_scan_top_n = _env_int(
+        "PUSH_POSTCLOSE_SCAN_TOPN", s.postclose_scan_top_n)
+    # 命中滑动记录窗口
+    s.hit_window_days = _env_int("PUSH_HIT_WINDOW_DAYS", s.hit_window_days)
+    s.hit_keep_dates = _env_int("PUSH_HIT_KEEP_DATES", s.hit_keep_dates)
 
     s.log_level = _env("PUSH_LOG_LEVEL", s.log_level).strip().upper()
     s.log_dir = _env("PUSH_LOG_DIR", s.log_dir).strip()
