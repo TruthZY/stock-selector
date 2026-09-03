@@ -17,6 +17,14 @@ download_failed.txt
 kline_cache_*.db.gz
 kline_cache_*.db
 
+# 推送系统密钥与运行时状态（密钥永不入库；只保留 *.example 样例）
+.env
+push.env
+deploy/push.env
+push/state/
+push/logs/
+!*.env.example
+
 # Python
 __pycache__/
 *.py[cod]
