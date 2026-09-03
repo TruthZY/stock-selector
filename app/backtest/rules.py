@@ -404,6 +404,126 @@ class KdjGoldenBuy(BuyRule):
 
 
 # ---------------------------------------------------------------------------
+# 建仓检测类规则
+# ---------------------------------------------------------------------------
+
+
+@register_buy("accumulation_detect")
+class AccumulationBuy(BuyRule):
+    """越千山建仓指标：检测主力建仓行为（BOLL通道+量价+低位+低点抬升）"""
+    key = "accumulation_detect"
+    name = "建仓信号检测"
+    desc = ("基于越千山建仓指标方法论，四维度共振检测建仓行为：\n"
+            "1) BOLL下轨上移(成本中枢上移) 2) 近期局部低点逐步抬高(底部承接)\n"
+            "3) 价格处于长周期低位(C/LLV<阈值) 4) 上涨放量下跌缩量(量价结构)")
+    default_params = {
+        "buy_amount": 10000.0,
+        "boll_n": 20,            # BOLL 周期
+        "boll_lookback": 20,     # BOLL 下轨上移回看根数
+        "low_window": 7,         # 局部低点判定窗口
+        "low_lookback": 90,      # 低点抬升检测回看范围
+        "position_lookback": 200,  # 价格位置判定回看范围
+        "position_pct": 35.0,    # 价格位置上限%(在长周期区间的百分位)
+        "vol_ratio": 1.0,        # 量价比阈值(上涨均量/下跌均量, 0=关闭)
+        "vol_days": 30,          # 量价统计天数
+        "min_conditions": 3,     # 最少满足条件数(1-4)
+    }
+    PARAM_LABELS = {
+        "buy_amount": "每笔买入金额(元)", "boll_n": "BOLL周期",
+        "boll_lookback": "BOLL下轨回看根数", "low_window": "局部低点窗口",
+        "low_lookback": "低点抬升回看范围", "position_lookback": "价格位置回看",
+        "position_pct": "价格位置上限%", "vol_ratio": "量价比阈值(0关)",
+        "vol_days": "量价统计天数", "min_conditions": "最少满足条件数",
+    }
+    PARAM_META = {
+        "min_conditions": {"type": "select", "options": _opts(
+            ("2", "2个条件"), ("3", "3个条件(推荐)"), ("4", "4个条件全满足"))},
+    }
+
+    def reset(self) -> None:
+        super().reset()
+        self._mid = self._upper = self._lower = []
+        self._local_low_idx = []
+
+    def prepare(self, bars: list) -> None:
+        closes = [k["close"] for k in bars]
+        n = int(self.params.get("boll_n", 20))
+        self._mid, self._upper, self._lower = ta.boll(closes, n)
+
+        # 预计算局部低点索引（7日窗口）
+        w = int(self.params.get("low_window", 7))
+        lows = [k["low"] for k in bars]
+        self._local_low_idx = []
+        for j in range(w, len(bars) - 1):
+            left = lows[max(0, j - w):j]
+            right = lows[j + 1:min(len(bars), j + w + 1)]
+            if left and right and lows[j] <= min(left) and lows[j] <= min(right):
+                self._local_low_idx.append(j)
+
+    def on_bar(self, ctx: BarContext) -> Optional[Signal]:
+        i = ctx.i
+        reasons = []
+        met = 0
+
+        # --- 条件1: BOLL下轨上移 ---
+        lookback = int(self.params.get("boll_lookback", 20))
+        if (i >= lookback and self._lower[i] is not None
+                and self._lower[i - lookback] is not None):
+            if self._lower[i] > self._lower[i - lookback]:
+                met += 1
+                reasons.append("BOLL下轨上移")
+
+        # --- 条件2: 近期局部低点逐步抬高 ---
+        low_lb = int(self.params.get("low_lookback", 90))
+        recent = [idx for idx in self._local_low_idx
+                  if i - low_lb <= idx <= i - 3]
+        if len(recent) >= 2:
+            prev_lows = [bars_j["low"] for bars_j in
+                         [ctx.bars[r] for r in recent[-2:]]]
+            if prev_lows[-1] > prev_lows[0]:
+                met += 1
+                reasons.append(f"低点抬高({prev_lows[0]:.2f}→{prev_lows[-1]:.2f})")
+
+        # --- 条件3: 价格处于长周期低位 ---
+        pos_lb = int(self.params.get("position_lookback", 200))
+        start = max(0, i - pos_lb)
+        hhv = max(k["high"] for k in ctx.bars[start:i + 1])
+        llv = min(k["low"] for k in ctx.bars[start:i + 1])
+        if hhv > llv:
+            pos_pct = (ctx.bar()["close"] - llv) / (hhv - llv) * 100
+            threshold = float(self.params.get("position_pct", 35))
+            if pos_pct <= threshold:
+                met += 1
+                reasons.append(f"低位{pos_pct:.0f}%")
+
+        # --- 条件4: 量价结构(上涨放量下跌缩量) ---
+        vr_threshold = float(self.params.get("vol_ratio", 1.0) or 0)
+        if vr_threshold > 0:
+            vol_days = int(self.params.get("vol_days", 30))
+            vs = max(0, i - vol_days)
+            up_vol, down_vol = [], []
+            for j in range(vs + 1, i + 1):
+                chg = ctx.bars[j]["close"] - ctx.bars[j - 1]["close"]
+                if chg > 0:
+                    up_vol.append(ctx.bars[j]["volume"])
+                elif chg < 0:
+                    down_vol.append(ctx.bars[j]["volume"])
+            if up_vol and down_vol:
+                avg_up = sum(up_vol) / len(up_vol)
+                avg_dn = sum(down_vol) / len(down_vol)
+                if avg_dn > 0 and avg_up / avg_dn >= vr_threshold:
+                    met += 1
+                    reasons.append(f"量比{avg_up / avg_dn:.1f}")
+
+        # --- 判定: 满足条件数 >= 阈值 ---
+        min_cond = int(self.params.get("min_conditions", 3))
+        if met >= min_cond:
+            return Signal("buy", amount=float(self.params["buy_amount"]),
+                          reason="建仓信号：" + "，".join(reasons))
+        return None
+
+
+# ---------------------------------------------------------------------------
 # 盘中异动类规则
 #
 # 这四条原本是实时侧写死的"快照策略"，读腾讯快照的 price/change_pct/volume/
@@ -764,6 +884,80 @@ class MacdDeathSell(SellRule):
             d1, e1 = self._dif[ctx.i], self._dea[ctx.i]
             if None not in (d0, e0, d1, e1) and d0 >= e0 and d1 < e1:
                 return Signal("sell", reason=f"MACD死叉 @ {bar['ts']}")
+        return None
+
+
+@register_sell("accumulation_exit")
+class AccumulationExitSell(SellRule):
+    """建仓策略卖出：BOLL下轨拐头+固定止损+MACD死叉"""
+    key = "accumulation_exit"
+    name = "建仓退出信号"
+    desc = ("建仓策略配套卖出规则：\n"
+            "1) 固定止损(跌破买入价N%) 2) BOLL下轨拐头向下(通道破坏)\n"
+            "3) MACD死叉确认")
+    default_params = {
+        "stop_loss_pct": 8.0,
+        "boll_n": 20,
+        "boll_turn_lookback": 5,   # BOLL下轨拐头回看根数
+        "macd_death": "on",        # MACD死叉: on/off
+        "fast": 12, "slow": 26, "signal": 9,
+    }
+    PARAM_LABELS = {
+        "stop_loss_pct": "固定止损%", "boll_n": "BOLL周期",
+        "boll_turn_lookback": "BOLL拐头回看", "macd_death": "MACD死叉",
+        "fast": "MACD快线", "slow": "MACD慢线", "signal": "MACD信号",
+    }
+    PARAM_META = {
+        "macd_death": {"type": "select", "options": _opts(
+            ("on", "开启"), ("off", "关闭"))},
+    }
+
+    def reset(self) -> None:
+        super().reset()
+        self._lower = []
+        self._dif = self._dea = []
+
+    def prepare(self, bars: list) -> None:
+        closes = [k["close"] for k in bars]
+        n = int(self.params.get("boll_n", 20))
+        _, _, self._lower = ta.boll(closes, n)
+        self._dif, self._dea, _ = ta.macd(
+            closes, int(self.params.get("fast", 12)),
+            int(self.params.get("slow", 26)), int(self.params.get("signal", 9)))
+
+    def on_bar(self, ctx: BarContext) -> Optional[Signal]:
+        pos: Position = ctx.position
+        bar = ctx.bar()
+        i = ctx.i
+
+        # 1. 固定止损
+        sl_pct = float(self.params.get("stop_loss_pct", 8.0) or 0)
+        if sl_pct > 0:
+            sl = pos.buy_price * (1 - sl_pct / 100.0)
+            if bar["low"] <= sl:
+                return Signal("sell", price=sl,
+                              reason=f"跌破{sl_pct}%止损({sl:.2f})")
+
+        # 2. BOLL下轨拐头向下（近N根从上升到下降）
+        turn = int(self.params.get("boll_turn_lookback", 5))
+        if (i >= turn + 1 and self._lower[i] is not None
+                and self._lower[i - turn] is not None):
+            # 当前下轨低于turn根前 → 通道走坏
+            if self._lower[i] < self._lower[i - turn]:
+                # 确认之前是上升的（再往前turn根）
+                if (i >= turn * 2 and self._lower[i - turn] is not None
+                        and self._lower[i - turn * 2] is not None
+                        and self._lower[i - turn] > self._lower[i - turn * 2]):
+                    return Signal("sell",
+                                  reason=f"BOLL下轨拐头({self._lower[i - turn]:.2f}→{self._lower[i]:.2f})")
+
+        # 3. MACD死叉
+        if self.params.get("macd_death", "on") == "on" and i >= 1:
+            d0, e0 = self._dif[i - 1], self._dea[i - 1]
+            d1, e1 = self._dif[i], self._dea[i]
+            if None not in (d0, e0, d1, e1) and d0 >= e0 and d1 < e1:
+                return Signal("sell", reason=f"MACD死叉 @ {bar['ts']}")
+
         return None
 
 
