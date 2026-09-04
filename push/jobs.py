@@ -102,6 +102,15 @@ async def job_scan_push(settings: Settings, period: str = "daily",
             rank_angle_w=settings.rank_angle_w, rank_vol_w=settings.rank_vol_w,
         )
         result = await scanner.scan()
+    except Exception as e:
+        # 扫描整体异常：记日志（traceback 落 push.log，稍后由日志尾附进推送），
+        # 造一个 ok=False 的结果，让下方组装"❌ 扫描失败 + 错误摘要 + 日志尾"并推送
+        if log:
+            log.exception("作业A[%s] 扫描异常", period)
+        result = ScanResult(ok=False, period=period, rule=rule_key, date=today,
+                            scanned=len(codes),
+                            msg=f"扫描异常：{type(e).__name__}: {e}",
+                            errors=[f"作业A[{period}] {type(e).__name__}: {e}"])
     finally:
         try:
             await ds.close()
@@ -113,20 +122,30 @@ async def job_scan_push(settings: Settings, period: str = "daily",
         # 注意：state 不在此清空——_record_and_attach 在下方还要用它写滑动记录。
         # State 是轻量对象（每次调用即开即关连接），保留引用无内存负担。
 
-    if log:
+    if log and result.ok:
         log.info("作业A[%s] 完成：%s", period, result.msg)
+
+    # 报错/降级/失败时附最近日志尾（已脱敏），让钉钉里就能初步定位
+    from push.logtail import tail_log
+    need_tail = bool(getattr(result, "errors", None)) or result.degraded or not result.ok
+    log_tail = tail_log(settings.log_dir, 20) if need_tail else None
 
     # 组装消息（覆盖率过低走降级告警；正常则记录命中并注入近N日次数）
     if result.ok and result.degraded:
-        title, md = formatter.build_degraded_message(result, scan_time)
+        title, md = formatter.build_degraded_message(result, scan_time, log_tail=log_tail)
     elif result.ok:
         if record:
             _record_and_attach(state, session, result, period,
                                settings.hit_window_days, settings.hit_keep_dates)
         title, md = formatter.build_message(
-            result, scan_time, top_n=eff_top_n, window_days=settings.hit_window_days)
+            result, scan_time, top_n=eff_top_n,
+            window_days=settings.hit_window_days, log_tail=log_tail)
     else:
-        title, md = "推送系统错误", f"### ❌ 扫描失败\n\n{result.msg}"
+        title = f"推送系统错误 · 作业A[{period}] 扫描失败"
+        lines = [f"### ❌ 扫描失败 · {period} · {scan_time}", "",
+                 f"> {result.msg}", "", f"· {today}"]
+        lines += formatter.build_error_section(result.errors, log_tail)
+        md = "\n".join(lines)
 
     if dry_run:
         print("=== DRY-RUN：作业A 结果（不推送）===")
@@ -258,6 +277,13 @@ async def job_scan_postclose(settings: Settings, period: str = "daily",
             rank_angle_w=settings.rank_angle_w, rank_vol_w=settings.rank_vol_w,
             source="cache")
         result = await scanner.scan()
+    except Exception as e:
+        if log:
+            log.exception("作业C[%s] 盘后扫描异常", period)
+        result = ScanResult(ok=False, period=period, rule=rule_key, date=today,
+                            scanned=len(pool),
+                            msg=f"盘后扫描异常：{type(e).__name__}: {e}",
+                            errors=[f"作业C[{period}] {type(e).__name__}: {e}"])
     finally:
         scanner = None
         store = None
@@ -274,17 +300,27 @@ async def job_scan_postclose(settings: Settings, period: str = "daily",
                           coverage=result.coverage, was_skipped=True,
                           skip_reason=reason, msg=reason)
 
-    if log:
+    if log and result.ok:
         log.info("作业C[%s] 完成：%s", period, result.msg)
+
+    # 报错/失败时附最近日志尾（已脱敏）
+    from push.logtail import tail_log
+    need_tail = bool(getattr(result, "errors", None)) or not result.ok
+    log_tail = tail_log(settings.log_dir, 20) if need_tail else None
 
     if result.ok:
         if record:
             _record_and_attach(state, "post", result, period,
                                settings.hit_window_days, settings.hit_keep_dates)
         title, md = formatter.build_postclose_message(
-            result, scan_time, top_n=eff_top_n, window_days=settings.hit_window_days)
+            result, scan_time, top_n=eff_top_n,
+            window_days=settings.hit_window_days, log_tail=log_tail)
     else:
-        title, md = "推送系统错误", f"### ❌ 盘后扫描失败\n\n{result.msg}"
+        title = f"推送系统错误 · 作业C[{period}] 盘后扫描失败"
+        lines = [f"### ❌ 盘后扫描失败 · {period} · {scan_time}", "",
+                 f"> {result.msg}", "", f"· {today}"]
+        lines += formatter.build_error_section(result.errors, log_tail)
+        md = "\n".join(lines)
 
     if dry_run:
         print("=== DRY-RUN：作业C(盘后) 结果（不推送）===")

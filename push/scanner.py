@@ -38,6 +38,9 @@ class ScanResult:
     skip_reason: str = ""
     # 推送结果（None=未推送/干跑，True/False=推送成功与否）
     push_ok: Optional[bool] = None
+    # 本次扫描采集到的报错明细（个股取数/检测异常、快照批失败、超时截止等），
+    # 供上层把"⚠️ 异常/错误"段附在推送末尾
+    errors: List[str] = field(default_factory=list)
 
 
 class PushScanner:
@@ -82,6 +85,7 @@ class PushScanner:
         if not codes:
             return ScanResult(False, self.period, self.rule_key, today, msg="股票池为空")
 
+        errors: List[str] = []   # 本次扫描采集的报错明细
         # 1&2. 取数：盘中=实时快照+历史；盘后=只读缓存收盘bar（不联网）
         snaps: Dict[str, dict] = {}
         if self.source == "cache":
@@ -89,15 +93,17 @@ class PushScanner:
             for code in codes:
                 try:
                     h = self.cache.get_all(code, self.period)
-                except Exception:
+                except Exception as e:
                     h = None
+                    errors.append(f"{code} 缓存读取失败: {type(e).__name__}: {e}")
                 if h:
                     hists[code] = h
         else:
-            snaps = await datafeed.fetch_snapshots(self.ds, codes, deadline=deadline)
+            snaps = await datafeed.fetch_snapshots(self.ds, codes, deadline=deadline,
+                                                   errors=errors)
             hists = await datafeed.load_histories(
                 self.ds, self.cache, codes, self.period,
-                deadline=deadline, concurrency=self.concurrency)
+                deadline=deadline, concurrency=self.concurrency, errors=errors)
 
         # 3. 逐股装配 + 检测
         matches: List[dict] = []
@@ -122,7 +128,8 @@ class PushScanner:
             hit = detector.detect_one(code, names.get(code, code), bars, rule_cls,
                                       params=self.params, mode=self.mode,
                                       min_bars=self.min_bars,
-                                      min_mid_angle=self.min_mid_angle)
+                                      min_mid_angle=self.min_mid_angle,
+                                      errors=errors)
             if hit is not None:
                 if self.source == "cache":
                     # 盘后：价格/涨跌幅取自缓存收盘bar（今收 vs 昨收）
@@ -151,6 +158,6 @@ class PushScanner:
             ok=True, period=self.period, rule=self.rule_key, date=today,
             matches=matches, scanned=len(codes), with_data=with_data,
             coverage=round(coverage, 4), degraded=(coverage < self.min_coverage),
-            skipped=skipped, elapsed_ms=elapsed,
+            skipped=skipped, elapsed_ms=elapsed, errors=errors,
             msg=f"命中 {len(matches)} / 参与判定 {with_data} / 计划 {len(codes)}"
                 f"（覆盖率 {coverage*100:.0f}%，跳过 {skipped}，耗时 {elapsed}ms）")

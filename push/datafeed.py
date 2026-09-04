@@ -110,17 +110,24 @@ def build_bars_close(hist: Optional[List[dict]], period: str = "daily",
 # 批量快照 & 历史加载（都带 deadline，超时即止）
 # ---------------------------------------------------------------------------
 async def fetch_snapshots(ds, codes: List[str], deadline: Optional[float] = None,
-                          batch: int = SNAPSHOT_BATCH) -> Dict[str, dict]:
-    """分批拉实时快照，合并返回 {code: snap}。到 deadline 停止后续批次。"""
+                          batch: int = SNAPSHOT_BATCH,
+                          errors: Optional[List[str]] = None) -> Dict[str, dict]:
+    """分批拉实时快照，合并返回 {code: snap}。到 deadline 停止后续批次。
+    errors 非空时记录每批失败（含批内代码范围与异常），供上层附在推送末尾。"""
     out: Dict[str, dict] = {}
     for i in range(0, len(codes), batch):
         if deadline is not None and time.time() > deadline:
+            if errors is not None:
+                errors.append(f"快照抓取超时截止：剩余 {len(codes)-i} 只未取（deadline 到点）")
             break
         chunk = codes[i:i + batch]
         try:
             out.update(await ds.snapshots(chunk))
-        except Exception:
+        except Exception as e:
             # 单批失败不阻断整体，缺的股票后续按"数据不齐"跳过
+            if errors is not None:
+                errors.append(f"快照批失败[{chunk[0]}..{chunk[-1]}]({len(chunk)}只): "
+                              f"{type(e).__name__}: {e}")
             continue
     return out
 
@@ -135,10 +142,12 @@ def _is_stale(hist: Optional[List[dict]], today: str, stale_days: int = STALE_DA
 async def load_histories(ds, cache, codes: List[str], period: str,
                          deadline: Optional[float] = None,
                          concurrency: int = 10, need: int = HIST_NEED,
-                         today: Optional[str] = None) -> Dict[str, List[dict]]:
+                         today: Optional[str] = None,
+                         errors: Optional[List[str]] = None) -> Dict[str, List[dict]]:
     """加载各股历史K线（优先缓存，陈旧才在线补，且只补今日之前的收盘bar）。
 
     返回 {code: bars升序}；无数据的股票不在结果里。到 deadline 停止发起新请求。
+    errors 非空时记录在线补齐失败的个股（缓存命中失败不算错，属正常无数据）。
     """
     today = today or today_str()
     sem = asyncio.Semaphore(concurrency)
@@ -161,8 +170,9 @@ async def load_histories(ds, cache, codes: List[str], period: str,
                     if hist_only:
                         cache.put(code, period, hist_only)
                         hist = hist_only
-                except Exception:
-                    pass
+                except Exception as e:
+                    if errors is not None:
+                        errors.append(f"{code} 历史补齐失败: {type(e).__name__}: {e}")
             if hist:
                 out[code] = hist
 

@@ -92,11 +92,15 @@ def _resolve_index(bars: List[dict], mode: str) -> Optional[int]:
 def detect_one(code: str, name: str, bars: Optional[List[dict]], rule_cls,
                params: Optional[Dict] = None, mode: str = "live",
                min_bars: int = DEFAULT_MIN_BARS,
-               min_mid_angle: Optional[float] = None) -> Optional[dict]:
+               min_mid_angle: Optional[float] = None,
+               errors: Optional[List[str]] = None) -> Optional[dict]:
     """对单只股票跑一次买入战法，命中返回 hit dict，否则 None。
 
     min_mid_angle 非空时加一道趋势过滤：布林中轨角度 < 阈值（或算不出）则丢弃，
     用于剔除中轨走平/向下的票（阈值 0 = 只要中轨不向下）。
+
+    errors 非空时：单股异常不再静默吞掉，会把 "code: 类型: 消息" 追加进去，
+    供上层把报错附在推送末尾（仍返回 None、不打断整场扫描）。
 
     hit: {code, name, reason, ts, price, i, n_conditions, vol_ratio, mid_angle}
     """
@@ -113,7 +117,9 @@ def detect_one(code: str, name: str, bars: Optional[List[dict]], rule_cls,
                        **(params or {})}               # 2. 再注入参数
         rule.prepare(bars)                             # 3. 用整段历史 prepare
         sig = rule.on_bar(BarContext(code, name, bars, i, None, rule.params))
-    except Exception:
+    except Exception as e:
+        if errors is not None:
+            errors.append(f"{code}: {type(e).__name__}: {e}")
         return None                                    # 单股异常=未命中，不阻断
     if sig is None or getattr(sig, "action", "") != "buy":
         return None

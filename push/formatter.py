@@ -31,9 +31,39 @@ def _counts_tag(m: dict, window_days: int = 10) -> str:
     return f"近{window_days}日 盘前{cp or 0}·盘后{cs or 0}"
 
 
+def build_error_section(errors=None, log_tail=None, max_errors: int = 8,
+                        max_line: int = 160) -> List[str]:
+    """构造"⚠️ 异常/错误"段（错误摘要 + 最近日志尾），无错无日志则返回空列表。
+
+    errors   : 本次扫描采集的报错明细（个股取数/检测异常、快照批失败、超时等）
+    log_tail : push.log 最近若干行（已脱敏）
+    钉钉单条消息有长度上限，故错误只列前 max_errors 条、日志行截断到 max_line 字符。
+    """
+    errs = [e for e in (errors or []) if e]
+    tail = [t for t in (log_tail or []) if t and t.strip()]
+    if not errs and not tail:
+        return []
+    out: List[str] = ["", "### ⚠️ 异常/错误"]
+    if errs:
+        head = f"> 采集到 **{len(errs)}** 条报错"
+        if len(errs) > max_errors:
+            head += f"，仅列前 {max_errors} 条"
+        out += [head, ""]
+        for e in errs[:max_errors]:
+            e = e if len(e) <= max_line else e[:max_line] + "…"
+            out.append(f"- `{e}`")
+    if tail:
+        out += ["", f"> 最近 {len(tail)} 行日志：", "", "```"]
+        for t in tail:
+            out.append(t if len(t) <= max_line else t[:max_line] + "…")
+        out.append("```")
+    return out
+
+
 def build_message(result, scan_time: str = "14:00", top_n: int = 0,
-                  window_days: int = 10) -> Tuple[str, str]:
-    """把 ScanResult 合并成 (title, markdown)。top_n>0 时只取前 N 只。"""
+                  window_days: int = 10, log_tail=None) -> Tuple[str, str]:
+    """把 ScanResult 合并成 (title, markdown)。top_n>0 时只取前 N 只。
+    result.errors 非空或传入 log_tail 时，末尾追加"⚠️ 异常/错误"段。"""
     plabel = period_label(result.period)
     mlabel = _mode_label("live" if result.period == "daily" else "close", scan_time)
     matches: List[dict] = list(result.matches)
@@ -72,11 +102,12 @@ def build_message(result, scan_time: str = "14:00", top_n: int = 0,
             lines.append("")
     lines.append("---")
     lines.append("_盘中预估，尾盘可能变化，仅供参考，不构成投资建议_")
+    lines += build_error_section(getattr(result, "errors", None), log_tail)
     return title, "\n".join(lines)
 
 
 def build_postclose_message(result, scan_time: str = "21:00", top_n: int = 0,
-                            window_days: int = 10) -> Tuple[str, str]:
+                            window_days: int = 10, log_tail=None) -> Tuple[str, str]:
     """盘后推送（精简版）：只列 排名 + 名称 + 代码 + 近N日盘前/盘后命中次数。
     不含现价/涨跌幅/中轨角度/建仓信号明细（按需求"不推送详细数据"）。"""
     plabel = period_label(result.period)
@@ -108,14 +139,15 @@ def build_postclose_message(result, scan_time: str = "21:00", top_n: int = 0,
             lines.append("")
     lines.append("---")
     lines.append(f"_盘后收盘数据；次数=近{window_days}个扫描日命中回数，仅供参考，不构成投资建议_")
+    lines += build_error_section(getattr(result, "errors", None), log_tail)
     return title, "\n".join(lines)
 
 
-def build_degraded_message(result, scan_time: str = "14:00") -> Tuple[str, str]:
+def build_degraded_message(result, scan_time: str = "14:00", log_tail=None) -> Tuple[str, str]:
     """覆盖率过低时的降级告警（避免把"没扫到"误报成"无信号"）。"""
     plabel = period_label(result.period)
     title = f"数据降级告警 · {plabel}"
-    md = "\n".join([
+    lines = [
         f"### ⚠️ 数据降级告警 · {plabel} · {scan_time}",
         "",
         f"> 覆盖率仅 **{result.coverage*100:.0f}%**（{result.with_data}/{result.scanned}），"
@@ -126,5 +158,6 @@ def build_degraded_message(result, scan_time: str = "14:00") -> Tuple[str, str]:
         "",
         "---",
         "_推送系统自动告警，请检查数据源与网络_",
-    ])
-    return title, md
+    ]
+    lines += build_error_section(getattr(result, "errors", None), log_tail)
+    return title, "\n".join(lines)

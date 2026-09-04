@@ -142,13 +142,22 @@ class Scheduler:
                         detail=f"landed={res.get('landed')}/{res.get('total')}")
 
     async def _alert(self, text: str) -> None:
-        """失败告警（尽力而为，不阻断调度）。"""
+        """失败告警（尽力而为，不阻断调度）。附最近日志尾便于远程定位。
+
+        注：作业内部的扫描/推送异常已由 jobs 自行捕获并推送带错误段的消息，
+        这里的 _alert 只兜底"逃逸出作业"的异常（如 state 写入/格式化环节）。
+        """
         try:
             if self.s.channel == "dingtalk" and self.s.has_dingtalk:
                 from push.pushers import get_pusher
+                from push.logtail import tail_log
+                tail = tail_log(self.s.log_dir, 20)
+                body = f"【推送系统告警】{text}"
+                if tail:
+                    body += "\n\n最近日志：\n" + "\n".join(tail)
                 p = get_pusher(self.s)
                 try:
-                    await p.send_text(f"【推送系统告警】{text}")
+                    await p.send_text(body)
                 finally:
                     await p.aclose()
         except Exception:
